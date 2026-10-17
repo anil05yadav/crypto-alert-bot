@@ -6,8 +6,20 @@ import numpy as np
 # ---------------- CONFIGURATION ----------------
 TELEGRAM_BOT_TOKEN = "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA"
 TELEGRAM_CHAT_ID   = "6470999168"
-SYMBOL             = "BTCUSDT"   # Coin symbol
-TIMEFRAME          = "15m"       # 15 Minute timeframe
+
+# Top High-Volume & Big Mover Crypto Pairs
+SYMBOLS = [
+    "BTCUSDT", 
+    "ETHUSDT", 
+    "SOLUSDT", 
+    "BNBUSDT", 
+    "XRPUSDT", 
+    "DOGEUSDT", 
+    "ADAUSDT", 
+    "AVAXUSDT"
+]
+
+TIMEFRAME          = "15m"
 
 SWING_LEN          = 20
 ATR_PERIOD         = 14
@@ -25,7 +37,7 @@ def send_telegram(message):
         print("Telegram error:", e)
         return False
 
-def fetch_binance_klines(symbol, interval, limit=250):
+def fetch_binance_klines(symbol, interval, limit=200):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     res = requests.get(url, timeout=10).json()
     df = pd.DataFrame(res, columns=[
@@ -39,93 +51,87 @@ def fetch_binance_klines(symbol, interval, limit=250):
     return df
 
 def run_strategy():
-    position = 0
-    print("Sniper Bot Initializing...")
+    # Saare coins ki position track karne ke liye
+    positions = {sym: 0 for sym in SYMBOLS}
+    
+    print("Multi-Coin Sniper Bot Initializing...")
 
-    # Immediate Startup Connection Test Message
-    test_sent = send_telegram(f"✅ *Connection Successful!*\n\n🤖 *Bot is now LIVE & Connected to Binance.*\nTracking: `{SYMBOL}` ({TIMEFRAME})\n_Scanning latest market state..._")
-    if not test_sent:
-        print("Telegram message send fail hua, token aur chat_id re-check karein.")
-
-    # Pehla scan karke current market status turant bhejega
-    try:
-        df_init = fetch_binance_klines(SYMBOL, TIMEFRAME, limit=150)
-        curr_price = df_init['close'].iloc[-1]
-        send_telegram(f"⚡ *Instant Status Confirmation*\nPair: `{SYMBOL}`\nCurrent Price: `${curr_price}`\nStatus: *Active & Monitoring 24/7*")
-    except Exception as e:
-        print("Initial status fetch error:", e)
+    symbols_text = ", ".join(SYMBOLS)
+    send_telegram(f"🔥 *Top Movers Sniper Engine Live!*\n\nCoins Tracking ({len(SYMBOLS)} Pairs):\n`{symbols_text}`\nTimeframe: `{TIMEFRAME}`\n_Scanning 24/7 on Cloud..._")
 
     while True:
-        try:
-            df = fetch_binance_klines(SYMBOL, TIMEFRAME, limit=150)
-            
-            # Running candle ko chhod kar finalized closed candle consider karenge
-            df = df.iloc[:-1].copy()
+        for sym in SYMBOLS:
+            try:
+                df = fetch_binance_klines(sym, TIMEFRAME, limit=150)
+                df = df.iloc[:-1].copy() # Sirf closed candle
 
-            # 1. ATR & Squeeze
-            tr1 = df['high'] - df['low']
-            tr2 = (df['high'] - df['close'].shift(1)).abs()
-            tr3 = (df['low'] - df['close'].shift(1)).abs()
-            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-            df['atr'] = tr.rolling(ATR_PERIOD).mean()
-            df['atr_ma'] = df['atr'].rolling(20).mean()
-            df['is_expanded'] = df['atr'] >= (df['atr_ma'] * 0.95)
+                # 1. ATR & Volatility Squeeze Filter
+                tr1 = df['high'] - df['low']
+                tr2 = (df['high'] - df['close'].shift(1)).abs()
+                tr3 = (df['low'] - df['close'].shift(1)).abs()
+                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                df['atr'] = tr.rolling(ATR_PERIOD).mean()
+                df['atr_ma'] = df['atr'].rolling(20).mean()
+                df['is_expanded'] = df['atr'] >= (df['atr_ma'] * 0.95)
 
-            # 2. Candle Conviction
-            candle_range = df['high'] - df['low']
-            candle_body  = (df['close'] - df['open']).abs()
-            df['solid_candle'] = (candle_body / candle_range) >= MIN_BODY_RATIO
+                # 2. Solid Candle Conviction
+                candle_range = df['high'] - df['low']
+                candle_body  = (df['close'] - df['open']).abs()
+                df['solid_candle'] = candle_range > 0 and ((candle_body / candle_range) >= MIN_BODY_RATIO)
 
-            # 3. EMA Trend Base
-            df['ema_base'] = df['close'].ewm(span=EMA_LEN, adjust=False).mean()
+                # 3. EMA Trend Base
+                df['ema_base'] = df['close'].ewm(span=EMA_LEN, adjust=False).mean()
 
-            # 4. Dynamic Trailing Trend State
-            up_trend = np.zeros(len(df))
-            dn_trend = np.zeros(len(df))
-            trend_state = np.zeros(len(df))
+                # 4. Dynamic Trailing Trend State
+                up_trend = np.zeros(len(df))
+                dn_trend = np.zeros(len(df))
+                trend_state = np.zeros(len(df))
 
-            for i in range(1, len(df)):
-                src_up = df['close'].iloc[i] - (ATR_MULT * df['atr'].iloc[i])
-                src_dn = df['close'].iloc[i] + (ATR_MULT * df['atr'].iloc[i])
+                for i in range(1, len(df)):
+                    src_up = df['close'].iloc[i] - (ATR_MULT * df['atr'].iloc[i])
+                    src_dn = df['close'].iloc[i] + (ATR_MULT * df['atr'].iloc[i])
 
-                up_trend[i] = max(src_up, up_trend[i-1]) if df['close'].iloc[i-1] > up_trend[i-1] else src_up
-                dn_trend[i] = min(src_dn, dn_trend[i-1]) if df['close'].iloc[i-1] < dn_trend[i-1] else src_dn
+                    up_trend[i] = max(src_up, up_trend[i-1]) if df['close'].iloc[i-1] > up_trend[i-1] else src_up
+                    dn_trend[i] = min(src_dn, dn_trend[i-1]) if df['close'].iloc[i-1] < dn_trend[i-1] else src_dn
 
-                if df['close'].iloc[i] > dn_trend[i-1]:
-                    trend_state[i] = 1
-                elif df['close'].iloc[i] < up_trend[i-1]:
-                    trend_state[i] = -1
-                else:
-                    trend_state[i] = trend_state[i-1]
+                    if df['close'].iloc[i] > dn_trend[i-1]:
+                        trend_state[i] = 1
+                    elif df['close'].iloc[i] < up_trend[i-1]:
+                        trend_state[i] = -1
+                    else:
+                        trend_state[i] = trend_state[i-1]
 
-            df['trend_state'] = trend_state
+                df['trend_state'] = trend_state
 
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
+                curr = df.iloc[-1]
+                prev = df.iloc[-2]
 
-            trend_bull = (curr['trend_state'] == 1 and prev['trend_state'] == -1)
-            trend_bear = (curr['trend_state'] == -1 and prev['trend_state'] == 1)
+                trend_bull = (curr['trend_state'] == 1 and prev['trend_state'] == -1)
+                trend_bear = (curr['trend_state'] == -1 and prev['trend_state'] == 1)
 
-            buy_signal  = trend_bull and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] > curr['ema_base'])
-            sell_signal = trend_bear and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] < curr['ema_base'])
+                buy_signal  = trend_bull and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] > curr['ema_base'])
+                sell_signal = trend_bear and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] < curr['ema_base'])
 
-            # Live Signal Trigger
-            if buy_signal and position != 1:
-                position = 1
-                msg = f"🟢 *SNIPER BUY SIGNAL!*\n\nPair: `{SYMBOL}`\nPrice: `{curr['close']}`\nTimeframe: `{TIMEFRAME}`\nSL: Swing Low\nTarget: 1:3 RR"
-                print(msg)
-                send_telegram(msg)
+                # Signal Execution
+                if buy_signal and positions[sym] != 1:
+                    positions[sym] = 1
+                    msg = f"🟢 *SNIPER BUY SIGNAL!*\n\nCoin: `#{sym}`\nPrice: `${curr['close']}`\nTimeframe: `{TIMEFRAME}`\nTarget: 1:3 RR"
+                    print(msg)
+                    send_telegram(msg)
 
-            elif sell_signal and position != -1:
-                position = -1
-                msg = f"🔴 *SNIPER SELL SIGNAL!*\n\nPair: `{SYMBOL}`\nPrice: `{curr['close']}`\nTimeframe: `{TIMEFRAME}`\nSL: Swing High\nTarget: 1:3 RR"
-                print(msg)
-                send_telegram(msg)
+                elif sell_signal and positions[sym] != -1:
+                    positions[sym] = -1
+                    msg = f"🔴 *SNIPER SELL SIGNAL!*\n\nCoin: `#{sym}`\nPrice: `${curr['close']}`\nTimeframe: `{TIMEFRAME}`\nTarget: 1:3 RR"
+                    print(msg)
+                    send_telegram(msg)
 
-        except Exception as err:
-            print("Loop Error:", err)
+            except Exception as err:
+                print(f"Error on {sym}:", err)
 
-        time.sleep(60)
+            time.sleep(1) # Har coin request ke beech 1 sec ka gap taaki API limit na lage
+
+        # Saare coins scan hone ke baad 45 seconds rest
+        time.sleep(45)
 
 if __name__ == "__main__":
     run_strategy()
