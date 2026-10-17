@@ -1,4 +1,7 @@
+import os
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import pandas as pd
 import numpy as np
@@ -7,7 +10,6 @@ import numpy as np
 TELEGRAM_BOT_TOKEN = "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA"
 TELEGRAM_CHAT_ID   = "6470999168"
 
-# Top High-Volume & Big Mover Crypto Pairs
 SYMBOLS = [
     "BTCUSDT", 
     "ETHUSDT", 
@@ -20,13 +22,26 @@ SYMBOLS = [
 ]
 
 TIMEFRAME          = "15m"
-
 SWING_LEN          = 20
 ATR_PERIOD         = 14
 ATR_MULT           = 2.4
 EMA_LEN            = 50
 MIN_BODY_RATIO     = 0.60
 
+# --- RENDER PORT BINDING (Fixes "No open ports detected" Error) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Crypto Sniper Bot is running 24/7!")
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# ---------------- TELEGRAM NOTIFIER ----------------
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
@@ -37,6 +52,7 @@ def send_telegram(message):
         print("Telegram error:", e)
         return False
 
+# ---------------- BINANCE FETCHER ----------------
 def fetch_binance_klines(symbol, interval, limit=200):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
     res = requests.get(url, timeout=10).json()
@@ -50,22 +66,21 @@ def fetch_binance_klines(symbol, interval, limit=200):
     df['close'] = df['close'].astype(float)
     return df
 
+# ---------------- STRATEGY SCANNER ----------------
 def run_strategy():
-    # Saare coins ki position track karne ke liye
     positions = {sym: 0 for sym in SYMBOLS}
-    
     print("Multi-Coin Sniper Bot Initializing...")
 
     symbols_text = ", ".join(SYMBOLS)
-    send_telegram(f"🔥 *Top Movers Sniper Engine Live!*\n\nCoins Tracking ({len(SYMBOLS)} Pairs):\n`{symbols_text}`\nTimeframe: `{TIMEFRAME}`\n_Scanning 24/7 on Cloud..._")
+    send_telegram(f"🔥 *Sniper Bot LIVE on Render!*\n\nTracking ({len(SYMBOLS)} Pairs):\n`{symbols_text}`\nTimeframe: `{TIMEFRAME}`\n_Monitoring 24/7 on Cloud..._")
 
     while True:
         for sym in SYMBOLS:
             try:
                 df = fetch_binance_klines(sym, TIMEFRAME, limit=150)
-                df = df.iloc[:-1].copy() # Sirf closed candle
+                df = df.iloc[:-1].copy()
 
-                # 1. ATR & Volatility Squeeze Filter
+                # 1. ATR & Squeeze
                 tr1 = df['high'] - df['low']
                 tr2 = (df['high'] - df['close'].shift(1)).abs()
                 tr3 = (df['low'] - df['close'].shift(1)).abs()
@@ -74,7 +89,7 @@ def run_strategy():
                 df['atr_ma'] = df['atr'].rolling(20).mean()
                 df['is_expanded'] = df['atr'] >= (df['atr_ma'] * 0.95)
 
-                # 2. Solid Candle Conviction
+                # 2. Solid Candle Check
                 candle_range = df['high'] - df['low']
                 candle_body  = (df['close'] - df['open']).abs()
                 df['solid_candle'] = candle_range > 0 and ((candle_body / candle_range) >= MIN_BODY_RATIO)
@@ -82,7 +97,7 @@ def run_strategy():
                 # 3. EMA Trend Base
                 df['ema_base'] = df['close'].ewm(span=EMA_LEN, adjust=False).mean()
 
-                # 4. Dynamic Trailing Trend State
+                # 4. Trailing Dynamic State
                 up_trend = np.zeros(len(df))
                 dn_trend = np.zeros(len(df))
                 trend_state = np.zeros(len(df))
@@ -112,7 +127,6 @@ def run_strategy():
                 buy_signal  = trend_bull and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] > curr['ema_base'])
                 sell_signal = trend_bear and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] < curr['ema_base'])
 
-                # Signal Execution
                 if buy_signal and positions[sym] != 1:
                     positions[sym] = 1
                     msg = f"🟢 *SNIPER BUY SIGNAL!*\n\nCoin: `#{sym}`\nPrice: `${curr['close']}`\nTimeframe: `{TIMEFRAME}`\nTarget: 1:3 RR"
@@ -126,12 +140,16 @@ def run_strategy():
                     send_telegram(msg)
 
             except Exception as err:
-                print(f"Error on {sym}:", err)
+                print(f"Error scanning {sym}:", err)
 
-            time.sleep(1) # Har coin request ke beech 1 sec ka gap taaki API limit na lage
+            time.sleep(1)
 
-        # Saare coins scan hone ke baad 45 seconds rest
         time.sleep(45)
 
 if __name__ == "__main__":
+    # Web server ko background thread me chalayenge taaki Render port pass ho jaye
+    server_thread = threading.Thread(target=start_health_server, daemon=True)
+    server_thread.start()
+
+    # Main Strategy Runner
     run_strategy()
