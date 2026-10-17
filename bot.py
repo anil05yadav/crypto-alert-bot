@@ -6,7 +6,7 @@ import numpy as np
 # ---------------- CONFIGURATION ----------------
 TELEGRAM_BOT_TOKEN = "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA"
 TELEGRAM_CHAT_ID   = "6470999168"
-SYMBOL             = "BTCUSDT"   # Coin symbol (e.g. BTCUSDT, ETHUSDT, SOLUSDT)
+SYMBOL             = "BTCUSDT"   # Coin symbol
 TIMEFRAME          = "15m"       # 15 Minute timeframe
 
 SWING_LEN          = 20
@@ -19,9 +19,11 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=10)
+        return res.status_code == 200
     except Exception as e:
         print("Telegram error:", e)
+        return False
 
 def fetch_binance_klines(symbol, interval, limit=250):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -37,15 +39,27 @@ def fetch_binance_klines(symbol, interval, limit=250):
     return df
 
 def run_strategy():
-    position = 0 # 1 for Long, -1 for Short
-    print("Sniper Bot Started... Monitoring Binance 24/7.")
-    send_telegram(f"🚀 *Crypto Sniper Alert Bot Active!*\nTracking: `{SYMBOL}` on `{TIMEFRAME}`")
+    position = 0
+    print("Sniper Bot Initializing...")
+
+    # Immediate Startup Connection Test Message
+    test_sent = send_telegram(f"✅ *Connection Successful!*\n\n🤖 *Bot is now LIVE & Connected to Binance.*\nTracking: `{SYMBOL}` ({TIMEFRAME})\n_Scanning latest market state..._")
+    if not test_sent:
+        print("Telegram message send fail hua, token aur chat_id re-check karein.")
+
+    # Pehla scan karke current market status turant bhejega
+    try:
+        df_init = fetch_binance_klines(SYMBOL, TIMEFRAME, limit=150)
+        curr_price = df_init['close'].iloc[-1]
+        send_telegram(f"⚡ *Instant Status Confirmation*\nPair: `{SYMBOL}`\nCurrent Price: `${curr_price}`\nStatus: *Active & Monitoring 24/7*")
+    except Exception as e:
+        print("Initial status fetch error:", e)
 
     while True:
         try:
             df = fetch_binance_klines(SYMBOL, TIMEFRAME, limit=150)
             
-            # Running candle ko chhodkar sirf closed candle consider karenge (Non-repainting)
+            # Running candle ko chhod kar finalized closed candle consider karenge
             df = df.iloc[:-1].copy()
 
             # 1. ATR & Squeeze
@@ -86,7 +100,6 @@ def run_strategy():
 
             df['trend_state'] = trend_state
 
-            # Signals on the latest closed candle
             curr = df.iloc[-1]
             prev = df.iloc[-2]
 
@@ -96,7 +109,7 @@ def run_strategy():
             buy_signal  = trend_bull and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] > curr['ema_base'])
             sell_signal = trend_bear and curr['is_expanded'] and curr['solid_candle'] and (curr['close'] < curr['ema_base'])
 
-            # Signal Trigger & Telegram Alert
+            # Live Signal Trigger
             if buy_signal and position != 1:
                 position = 1
                 msg = f"🟢 *SNIPER BUY SIGNAL!*\n\nPair: `{SYMBOL}`\nPrice: `{curr['close']}`\nTimeframe: `{TIMEFRAME}`\nSL: Swing Low\nTarget: 1:3 RR"
@@ -112,7 +125,6 @@ def run_strategy():
         except Exception as err:
             print("Loop Error:", err)
 
-        # Har 1 minute me check karega
         time.sleep(60)
 
 if __name__ == "__main__":
