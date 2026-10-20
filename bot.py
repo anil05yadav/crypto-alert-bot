@@ -21,19 +21,17 @@ SYMBOLS = [
     "AVAXUSDT"
 ]
 
-TIMEFRAME          = "15m"
-ATR_PERIOD         = 14
-ATR_MULT           = 2.4
-EMA_LEN            = 50
-MIN_BODY_RATIO     = 0.55  # Realistic threshold taaki clean wick sweep miss na ho
+TIMEFRAME  = "15m"
+PERIOD     = 20
+ATR_LEN    = 14
+ATR_MULT   = 2.4
 
-# --- RENDER HEALTH CHECK SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Crypto Sniper Bot is running 24/7!")
+        self.wfile.write(b"Sniper Bot Active")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -49,15 +47,12 @@ def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        return res.status_code == 200
+        requests.post(url, json=payload, timeout=8)
     except Exception as e:
-        print("Telegram Error:", e)
-        return False
+        print("Telegram Send Error:", e)
 
-# BINANCE FUTURES API (Matches TradingView BTCUSDT.P 100%)
-def fetch_binance_futures_klines(symbol, interval, limit=200):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+def fetch_klines(symbol):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={TIMEFRAME}&limit=120"
     res = requests.get(url, timeout=10).json()
     df = pd.DataFrame(res, columns=[
         'time', 'open', 'high', 'low', 'close', 'volume',
@@ -69,117 +64,92 @@ def fetch_binance_futures_klines(symbol, interval, limit=200):
     df['close'] = df['close'].astype(float)
     return df
 
-# TradingView Pine Script Exact RMA Function
 def rma(series, length):
     alpha = 1.0 / length
     return series.ewm(alpha=alpha, adjust=False).mean()
 
 def run_strategy():
-    positions = {sym: 0 for sym in SYMBOLS}
-    last_processed_candle_time = {sym: 0 for sym in SYMBOLS}
+    last_signal = {sym: 0 for sym in SYMBOLS}
+    last_candle = {sym: 0 for sym in SYMBOLS}
 
-    print("Multi-Coin Sniper Bot Initialized (Futures Feed)...")
-    symbols_text = ", ".join(SYMBOLS)
-    send_telegram(f"⚡ *Futures Sniper Engine Active!*\n\nData Feed: `Binance Futures (fapi)`\nTracking: `{symbols_text}`\nTimeframe: `{TIMEFRAME}`")
+    send_telegram("🚀 *Sniper Bot v3 Synced!*\n\nAll filter bottlenecks removed. Waiting for next 15M candle close.")
 
     while True:
         for sym in SYMBOLS:
             try:
-                df = fetch_binance_futures_klines(sym, TIMEFRAME, limit=150)
+                df = fetch_klines(sym)
+                # Last closed candle
+                c_time = df.iloc[-2]['time']
                 
-                # Sirf LAST CLOSED candle check karni hai
-                closed_candle_time = df.iloc[-2]['time']
-                
-                # Agar is candle ko pehle hi check kar chuke hain to dobara evaluate mat karo
-                if last_processed_candle_time[sym] == closed_candle_time:
+                if last_candle[sym] == c_time:
                     continue
 
-                # Closed candles dataframe
                 cdf = df.iloc[:-1].copy()
 
-                # 1. Exact Pine Script ATR (using RMA)
+                # ATR RMA
                 tr1 = cdf['high'] - cdf['low']
                 tr2 = (cdf['high'] - cdf['close'].shift(1)).abs()
                 tr3 = (cdf['low'] - cdf['close'].shift(1)).abs()
                 tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                
-                cdf['atr'] = rma(tr, ATR_PERIOD)
-                cdf['atr_ma'] = cdf['atr'].rolling(20).mean()
-                cdf['is_expanded'] = cdf['atr'] >= (cdf['atr_ma'] * 0.90)
+                cdf['atr'] = rma(tr, ATR_LEN)
 
-                # 2. Candle Conviction Ratio
-                candle_range = cdf['high'] - cdf['low']
-                candle_body  = (cdf['close'] - cdf['open']).abs()
-                cdf['solid_candle'] = (candle_range > 0) & ((candle_body / candle_range) >= MIN_BODY_RATIO)
-
-                # 3. EMA 50
-                cdf['ema_base'] = cdf['close'].ewm(span=EMA_LEN, adjust=False).mean()
-
-                # 4. Supertrend / Dynamic Trailing Logic
+                # SuperTrend Core
                 up_trend = np.zeros(len(cdf))
                 dn_trend = np.zeros(len(cdf))
-                trend_state = np.zeros(len(cdf))
+                trend = np.zeros(len(cdf))
 
                 for i in range(1, len(cdf)):
-                    src_up = cdf['close'].iloc[i] - (ATR_MULT * cdf['atr'].iloc[i])
-                    src_dn = cdf['close'].iloc[i] + (ATR_MULT * cdf['atr'].iloc[i])
+                    hl2 = (cdf['high'].iloc[i] + cdf['low'].iloc[i]) / 2.0
+                    up = hl2 - (ATR_MULT * cdf['atr'].iloc[i])
+                    dn = hl2 + (ATR_MULT * cdf['atr'].iloc[i])
 
-                    up_trend[i] = max(src_up, up_trend[i-1]) if cdf['close'].iloc[i-1] > up_trend[i-1] else src_up
-                    dn_trend[i] = min(src_dn, dn_trend[i-1]) if cdf['close'].iloc[i-1] < dn_trend[i-1] else src_dn
+                    up_trend[i] = max(up, up_trend[i-1]) if cdf['close'].iloc[i-1] > up_trend[i-1] else up
+                    dn_trend[i] = min(dn, dn_trend[i-1]) if cdf['close'].iloc[i-1] < dn_trend[i-1] else dn
 
                     if cdf['close'].iloc[i] > dn_trend[i-1]:
-                        trend_state[i] = 1
+                        trend[i] = 1
                     elif cdf['close'].iloc[i] < up_trend[i-1]:
-                        trend_state[i] = -1
+                        trend[i] = -1
                     else:
-                        trend_state[i] = trend_state[i-1]
+                        trend[i] = trend[i-1]
 
-                cdf['trend_state'] = trend_state
-
+                cdf['trend'] = trend
                 curr = cdf.iloc[-1]
                 prev = cdf.iloc[-2]
 
-                trend_bull = (curr['trend_state'] == 1 and prev['trend_state'] == -1)
-                trend_bear = (curr['trend_state'] == -1 and prev['trend_state'] == 1)
+                # Direct Trend Transition Check
+                if curr['trend'] == 1 and prev['trend'] == -1:
+                    if last_signal[sym] != 1:
+                        last_signal[sym] = 1
+                        msg = (
+                            f"🟢 *SNIPER BUY SIGNAL*\n\n"
+                            f"Pair: `#{sym}`\n"
+                            f"Price: `${curr['close']:.2f}`\n"
+                            f"Timeframe: `15m`\n"
+                            f"Target: Next Swing High"
+                        )
+                        send_telegram(msg)
 
-                buy_signal  = trend_bull and curr['is_expanded'] and (curr['close'] > curr['ema_base'])
-                sell_signal = trend_bear and curr['is_expanded'] and (curr['close'] < curr['ema_base'])
+                elif curr['trend'] == -1 and prev['trend'] == 1:
+                    if last_signal[sym] != -1:
+                        last_signal[sym] = -1
+                        msg = (
+                            f"🔴 *SNIPER SELL SIGNAL*\n\n"
+                            f"Pair: `#{sym}`\n"
+                            f"Price: `${curr['close']:.2f}`\n"
+                            f"Timeframe: `15m`\n"
+                            f"Target: Next Swing Low"
+                        )
+                        send_telegram(msg)
 
-                if buy_signal and positions[sym] != 1:
-                    positions[sym] = 1
-                    msg = (
-                        f"🟢 *SNIPER BUY SIGNAL!*\n\n"
-                        f"Coin: `#{sym}`\n"
-                        f"Entry (Close): `${curr['close']:.2f}`\n"
-                        f"Timeframe: `{TIMEFRAME}`\n"
-                        f"SL: Below Swing Low\n"
-                        f"Target: 1:2 to 1:3 RR"
-                    )
-                    print(msg)
-                    send_telegram(msg)
+                last_candle[sym] = c_time
 
-                elif sell_signal and positions[sym] != -1:
-                    positions[sym] = -1
-                    msg = (
-                        f"🔴 *SNIPER SELL SIGNAL!*\n\n"
-                        f"Coin: `#{sym}`\n"
-                        f"Entry (Close): `${curr['close']:.2f}`\n"
-                        f"Timeframe: `{TIMEFRAME}`\n"
-                        f"SL: Above Swing High\n"
-                        f"Target: 1:2 to 1:3 RR"
-                    )
-                    print(msg)
-                    send_telegram(msg)
-
-                # Mark this closed candle as processed
-                last_processed_candle_time[sym] = closed_candle_time
-
-            except Exception as err:
-                print(f"Error checking {sym}:", err)
+            except Exception as e:
+                print(f"Error {sym}:", e)
 
             time.sleep(0.5)
 
-        time.sleep(15)  # Scan every 15 seconds so no closed candle is missed
+        time.sleep(10)
 
 if __name__ == "__main__":
     server_thread = threading.Thread(target=start_health_server, daemon=True)
