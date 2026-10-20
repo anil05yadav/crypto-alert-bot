@@ -13,12 +13,6 @@ TELEGRAM_CHAT_ID   = "6470999168"
 SYMBOLS = [
     "BTCUSDT", 
     "ETHUSDT", 
-    "SOLUSDT", 
-    "BNBUSDT", 
-    "XRPUSDT", 
-    "DOGEUSDT", 
-    "ADAUSDT", 
-    "AVAXUSDT"
 ]
 
 TIMEFRAME  = "15m"
