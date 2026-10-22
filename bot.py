@@ -10,10 +10,10 @@ import numpy as np
 TELEGRAM_BOT_TOKEN = "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA"
 TELEGRAM_CHAT_ID   = "6470999168"
 
-SYMBOLS    = ["BTCUSDT", "ETHUSDT"]
-TIMEFRAME  = "15m"
+# Delta Exchange Symbols
+SYMBOLS    = ["BTCUSD", "ETHUSD"]
+TIMEFRAME  = "15m"  # Delta resolution: 15m, 1d
 
-# Pine Script Inputs
 SWING_LEN  = 20
 ATR_PERIOD = 14
 ATR_MULT   = 2.4
@@ -25,7 +25,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Trend Liquidity Sniper Engine 24/7 LIVE")
+        self.wfile.write(b"Delta Sniper Engine 24/7 LIVE")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -42,30 +42,33 @@ def send_telegram(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=8)
-        print(f"Telegram sent status: {r.status_code}", flush=True)
+        print(f"Telegram status: {r.status_code}", flush=True)
     except Exception as e:
-        print("Telegram Send Error:", e, flush=True)
+        print(f"Telegram error: {e}", flush=True)
 
-def fetch_klines(symbol, interval, limit=200):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+# Delta Exchange Candle Fetcher (100% Free Public API)
+def fetch_delta_klines(symbol, resolution="15m", limit=120):
+    now = int(time.time())
+    # 15m = 900 seconds per candle
+    sec_per_bar = 86400 if resolution == "1d" else 900
+    start_time = now - (limit * sec_per_bar)
+    
+    url = f"https://api.delta.exchange/v2/chart/history?symbol={symbol}&resolution={resolution}&from={start_time}&to={now}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
     try:
         res = requests.get(url, headers=headers, timeout=8).json()
-        if not isinstance(res, list) or len(res) < 50:
-            # Fallback to Spot if Futures throws limit
-            spot_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-            res = requests.get(spot_url, headers=headers, timeout=8).json()
-        
-        df = pd.DataFrame(res, columns=[
-            'time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-        ])
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
-        return df
+        if res.get("success") and res.get("result"):
+            data = res["result"]
+            df = pd.DataFrame(data)
+            # Delta returns: time, open, high, low, close, volume
+            df = df.sort_values("time").reset_index(drop=True)
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df[col].astype(float)
+            return df
     except Exception as e:
-        print(f"Fetch Error for {symbol} ({interval}): {e}", flush=True)
-        return pd.DataFrame()
+        print(f"Delta API Error for {symbol}: {e}", flush=True)
+    return pd.DataFrame()
 
 def rma(series, length):
     alpha = 1.0 / length
@@ -76,25 +79,27 @@ def run_strategy():
     last_processed_candle_time = {sym: None for sym in SYMBOLS}
     test_alert_done = {sym: False for sym in SYMBOLS}
 
-    print("Sniper Bot Engine Starting...", flush=True)
+    print(">>> Delta Exchange Sniper Engine Started <<<", flush=True)
     send_telegram(
-        "🚀 *Engine Deployed & Running!*\n\n"
-        "Testing loop live right now..."
+        "⚡ *Delta Exchange Sniper Engine Active!*\n\n"
+        "DataSource: `Delta Exchange API`\n"
+        "Pairs: `BTCUSD, ETHUSD`\n"
+        "Status: Connecting to candles..."
     )
 
     while True:
         for sym in SYMBOLS:
             try:
                 # 1. Fetch 15m Candles
-                df = fetch_klines(sym, TIMEFRAME, limit=150)
-                if df.empty or len(df) < 60:
+                df = fetch_delta_klines(sym, resolution="15m", limit=120)
+                if df.empty or len(df) < 50:
+                    print(f"[{sym}] Waiting for Delta data...", flush=True)
                     continue
-                
+
                 closed_candle = df.iloc[-2]
                 closed_time = closed_candle['time']
 
                 is_new_candle = (last_processed_candle_time[sym] != closed_time)
-                
                 if not is_new_candle and test_alert_done[sym]:
                     continue
 
@@ -102,13 +107,13 @@ def run_strategy():
                 n = len(cdf)
 
                 # 2. Fetch Daily PDH / PDL
-                daily_df = fetch_klines(sym, "1d", limit=5)
-                if daily_df.empty or len(daily_df) < 2:
-                    pdh = cdf['high'].max()
-                    pdl = cdf['low'].min()
-                else:
+                daily_df = fetch_delta_klines(sym, resolution="1d", limit=4)
+                if not daily_df.empty and len(daily_df) >= 2:
                     pdh = daily_df.iloc[-2]['high']
                     pdl = daily_df.iloc[-2]['low']
+                else:
+                    pdh = cdf['high'].max()
+                    pdl = cdf['low'].min()
 
                 # 3. ATR & Volatility Expansion
                 tr1 = cdf['high'] - cdf['low']
@@ -124,11 +129,9 @@ def run_strategy():
                 c_range = cdf['high'] - cdf['low']
                 c_body = (cdf['close'] - cdf['open']).abs()
                 cdf['solid_candle'] = np.where(c_range > 0, (c_body / c_range) >= MIN_BODY, False)
-
-                # 5. EMA 50
                 cdf['ema_base'] = cdf['close'].ewm(span=EMA_LEN, adjust=False).mean()
 
-                # 6. Major Swing Pivots
+                # 5. Major Swing Pivots
                 highs = cdf['high'].values
                 lows = cdf['low'].values
                 closes = cdf['close'].values
@@ -147,7 +150,7 @@ def run_strategy():
                     major_high[i] = curr_maj_high
                     major_low[i] = curr_maj_low
 
-                # 7. Dynamic Trailing Trend Engine
+                # 6. Dynamic Trailing Trend Engine
                 up_trend = np.zeros(n)
                 dn_trend = np.zeros(n)
                 trend_state = np.zeros(n, dtype=int)
@@ -167,7 +170,7 @@ def run_strategy():
                     else:
                         trend_state[i] = trend_state[i-1]
 
-                # 8. Sweep Validation
+                # 7. Sweep Validation
                 lookback_start = max(0, n - 21)
                 swept_low = any(lows[k] < pdl or (not np.isnan(major_low[k]) and lows[k] < major_low[k]) for k in range(n - 1, lookback_start - 1, -1))
                 swept_high = any(highs[k] > pdh or (not np.isnan(major_high[k]) and highs[k] > major_high[k]) for k in range(n - 1, lookback_start - 1, -1))
@@ -180,24 +183,24 @@ def run_strategy():
                 is_exp = bool(cdf['is_expanded'].iloc[-1])
                 is_solid = bool(cdf['solid_candle'].iloc[-1])
 
-                print(f"[{sym}] Checked! Close: {curr_close}, Trend: {trend_state[-1]}, EMA: {curr_ema:.2f}", flush=True)
+                print(f"[{sym}] Checked! Close: {curr_close:.2f}, Trend: {trend_state[-1]}", flush=True)
 
-                # IMMEDIATE TEST ALERT ON STARTUP
+                # Instant Test Alert on Startup
                 if not test_alert_done[sym]:
                     test_alert_done[sym] = True
                     last_processed_candle_time[sym] = closed_time
                     state_str = "BULLISH 🟢" if trend_state[-1] == 1 else "BEARISH 🔴"
                     test_msg = (
-                        f"🧪 *INSTANT TEST CONFIRMATION*\n\n"
+                        f"🧪 *DELTA EXCHANGE TEST ALERT*\n\n"
                         f"Coin: `#{sym}`\n"
-                        f"Last Closed Price: `${curr_close:.2f}`\n"
-                        f"Trend State: `{state_str}`\n"
+                        f"Last Close: `${curr_close:.2f}`\n"
+                        f"Trend: `{state_str}`\n"
                         f"EMA 50: `${curr_ema:.2f}`\n\n"
-                        f"✅ Loop active hai aur 15m data successfully compute ho raha hai!"
+                        f"✅ Delta Exchange connection 100% active!"
                     )
                     send_telegram(test_msg)
 
-                # 9. Real Pine Script Signal Conditions
+                # 8. Real Signals
                 raw_buy = trend_flipped_bull and (swept_low or curr_close > curr_ema) and is_exp and is_solid
                 raw_sell = trend_flipped_bear and (swept_high or curr_close < curr_ema) and is_exp and is_solid
 
@@ -206,25 +209,21 @@ def run_strategy():
 
                 if buy_condition:
                     positions[sym] = 1
-                    msg = (
-                        f"🟢 *SNIPER BUY ALERT!*\n\n"
+                    send_telegram(
+                        f"🟢 *SNIPER BUY ALERT (DELTA)*\n\n"
                         f"Coin: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
-                        f"Timeframe: `15m`\n"
-                        f"Validation: Trend Flip Bull + Pine Conditions Met"
+                        f"Timeframe: `15m`"
                     )
-                    send_telegram(msg)
 
                 elif sell_condition:
                     positions[sym] = -1
-                    msg = (
-                        f"🔴 *SNIPER SELL ALERT!*\n\n"
+                    send_telegram(
+                        f"🔴 *SNIPER SELL ALERT (DELTA)*\n\n"
                         f"Coin: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
-                        f"Timeframe: `15m`\n"
-                        f"Validation: Trend Flip Bear + Pine Conditions Met"
+                        f"Timeframe: `15m`"
                     )
-                    send_telegram(msg)
 
                 last_processed_candle_time[sym] = closed_time
 
@@ -233,7 +232,7 @@ def run_strategy():
 
             time.sleep(1)
 
-        time.sleep(15)
+        time.sleep(12)
 
 if __name__ == "__main__":
     server_thread = threading.Thread(target=start_health_server, daemon=True)
