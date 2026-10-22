@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -14,14 +13,12 @@ TELEGRAM_CHAT_ID   = "6470999168"
 SYMBOLS    = ["BTCUSDT", "ETHUSDT"]
 TIMEFRAME  = "15m"
 
+# Pine Script Inputs
 SWING_LEN  = 20
 ATR_PERIOD = 14
 ATR_MULT   = 2.4
 EMA_LEN    = 50
 MIN_BODY   = 0.60
-
-def log(msg):
-    print(msg, flush=True)
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -45,20 +42,30 @@ def send_telegram(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=8)
-        log(f"Telegram sent status: {r.status_code}")
+        print(f"Telegram sent status: {r.status_code}", flush=True)
     except Exception as e:
-        log(f"Telegram Send Error: {e}")
+        print("Telegram Send Error:", e, flush=True)
 
-def fetch_klines(symbol, interval, limit=250):
+def fetch_klines(symbol, interval, limit=200):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    res = requests.get(url, timeout=10).json()
-    df = pd.DataFrame(res, columns=[
-        'time', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-    ])
-    for col in ['open', 'high', 'low', 'close']:
-        df[col] = df[col].astype(float)
-    return df
+    try:
+        res = requests.get(url, headers=headers, timeout=8).json()
+        if not isinstance(res, list) or len(res) < 50:
+            # Fallback to Spot if Futures throws limit
+            spot_url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+            res = requests.get(spot_url, headers=headers, timeout=8).json()
+        
+        df = pd.DataFrame(res, columns=[
+            'time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+        ])
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+        return df
+    except Exception as e:
+        print(f"Fetch Error for {symbol} ({interval}): {e}", flush=True)
+        return pd.DataFrame()
 
 def rma(series, length):
     alpha = 1.0 / length
@@ -66,32 +73,44 @@ def rma(series, length):
 
 def run_strategy():
     positions = {sym: 0 for sym in SYMBOLS}
-    last_processed_candle_time = {sym: 0 for sym in SYMBOLS}
-    initial_check_sent = False
+    last_processed_candle_time = {sym: None for sym in SYMBOLS}
+    test_alert_done = {sym: False for sym in SYMBOLS}
 
-    log("Sniper Bot Engine Starting...")
+    print("Sniper Bot Engine Starting...", flush=True)
     send_telegram(
-        f"🎯 *Trend Liquidity Sniper Engine Active!*\n\n"
-        f"Pairs: `BTCUSDT, ETHUSDT` (15m)\n"
-        f"Logging: `Live Stream Active`\n"
-        f"Status: Next candle par instant test alert aayega."
+        "🚀 *Engine Deployed & Running!*\n\n"
+        "Testing loop live right now..."
     )
 
     while True:
         for sym in SYMBOLS:
             try:
-                df = fetch_klines(sym, TIMEFRAME, limit=250)
-                closed_time = int(df.iloc[-2]['time'])
+                # 1. Fetch 15m Candles
+                df = fetch_klines(sym, TIMEFRAME, limit=150)
+                if df.empty or len(df) < 60:
+                    continue
+                
+                closed_candle = df.iloc[-2]
+                closed_time = closed_candle['time']
 
-                # Daily PDH / PDL
-                daily_df = fetch_klines(sym, "1d", limit=5)
-                pdh = float(daily_df.iloc[-2]['high'])
-                pdl = float(daily_df.iloc[-2]['low'])
+                is_new_candle = (last_processed_candle_time[sym] != closed_time)
+                
+                if not is_new_candle and test_alert_done[sym]:
+                    continue
 
                 cdf = df.iloc[:-1].copy().reset_index(drop=True)
                 n = len(cdf)
 
-                # ATR RMA
+                # 2. Fetch Daily PDH / PDL
+                daily_df = fetch_klines(sym, "1d", limit=5)
+                if daily_df.empty or len(daily_df) < 2:
+                    pdh = cdf['high'].max()
+                    pdl = cdf['low'].min()
+                else:
+                    pdh = daily_df.iloc[-2]['high']
+                    pdl = daily_df.iloc[-2]['low']
+
+                # 3. ATR & Volatility Expansion
                 tr1 = cdf['high'] - cdf['low']
                 tr2 = (cdf['high'] - cdf['close'].shift(1)).abs()
                 tr3 = (cdf['low'] - cdf['close'].shift(1)).abs()
@@ -101,34 +120,34 @@ def run_strategy():
                 cdf['atr_ma'] = cdf['atr'].rolling(20).mean()
                 cdf['is_expanded'] = cdf['atr'] >= (cdf['atr_ma'] * 0.95)
 
-                # Solid Candle Check
+                # 4. Solid Candle Body Ratio
                 c_range = cdf['high'] - cdf['low']
                 c_body = (cdf['close'] - cdf['open']).abs()
                 cdf['solid_candle'] = np.where(c_range > 0, (c_body / c_range) >= MIN_BODY, False)
 
-                # EMA 50
+                # 5. EMA 50
                 cdf['ema_base'] = cdf['close'].ewm(span=EMA_LEN, adjust=False).mean()
 
-                # Pivot High / Low
+                # 6. Major Swing Pivots
+                highs = cdf['high'].values
+                lows = cdf['low'].values
+                closes = cdf['close'].values
+
                 major_high = np.full(n, np.nan)
                 major_low = np.full(n, np.nan)
                 curr_maj_high = np.nan
                 curr_maj_low = np.nan
 
-                highs = cdf['high'].values
-                lows = cdf['low'].values
-                closes = cdf['close'].values
-
                 for i in range(SWING_LEN * 2, n):
                     center_idx = i - SWING_LEN
-                    if all(highs[center_idx] > highs[j] for j in range(center_idx - SWING_LEN, center_idx + SWING_LEN + 1) if j != center_idx):
+                    if all(highs[center_idx] >= highs[j] for j in range(center_idx - SWING_LEN, center_idx + SWING_LEN + 1) if j != center_idx):
                         curr_maj_high = highs[center_idx]
-                    if all(lows[center_idx] < lows[j] for j in range(center_idx - SWING_LEN, center_idx + SWING_LEN + 1) if j != center_idx):
+                    if all(lows[center_idx] <= lows[j] for j in range(center_idx - SWING_LEN, center_idx + SWING_LEN + 1) if j != center_idx):
                         curr_maj_low = lows[center_idx]
                     major_high[i] = curr_maj_high
                     major_low[i] = curr_maj_low
 
-                # Dynamic Trailing Trend Engine
+                # 7. Dynamic Trailing Trend Engine
                 up_trend = np.zeros(n)
                 dn_trend = np.zeros(n)
                 trend_state = np.zeros(n, dtype=int)
@@ -148,49 +167,37 @@ def run_strategy():
                     else:
                         trend_state[i] = trend_state[i-1]
 
-                # Sweep Validation
-                swept_low = False
-                swept_high = False
+                # 8. Sweep Validation
                 lookback_start = max(0, n - 21)
-                for k in range(n - 1, lookback_start - 1, -1):
-                    if lows[k] < pdl or (not np.isnan(major_low[k]) and lows[k] < major_low[k]):
-                        swept_low = True
-                        break
+                swept_low = any(lows[k] < pdl or (not np.isnan(major_low[k]) and lows[k] < major_low[k]) for k in range(n - 1, lookback_start - 1, -1))
+                swept_high = any(highs[k] > pdh or (not np.isnan(major_high[k]) and highs[k] > major_high[k]) for k in range(n - 1, lookback_start - 1, -1))
 
-                for k in range(n - 1, lookback_start - 1, -1):
-                    if highs[k] > pdh or (not np.isnan(major_high[k]) and highs[k] > major_high[k]):
-                        swept_high = True
-                        break
+                trend_flipped_bull = (trend_state[-1] == 1 and trend_state[-2] == -1)
+                trend_flipped_bear = (trend_state[-1] == -1 and trend_state[-2] == 1)
 
                 curr_close = closes[-1]
                 curr_ema = cdf['ema_base'].iloc[-1]
                 is_exp = bool(cdf['is_expanded'].iloc[-1])
                 is_solid = bool(cdf['solid_candle'].iloc[-1])
-                trend_val = trend_state[-1]
 
-                # First Run Instant Diagnostic Message
-                if not initial_check_sent:
-                    initial_check_sent = True
-                    diag_msg = (
-                        f"⚡ *SYSTEM HEALTH CHECK: OK*\n\n"
-                        f"Pair: `#{sym}`\n"
-                        f"Price: `${curr_close:.2f}`\n"
-                        f"Trend: `{'BULL 🟢' if trend_val == 1 else 'BEAR 🔴'}`\n"
-                        f"EMA50: `${curr_ema:.2f}`\n"
-                        f"ATR Expanded: `{is_exp}`\n"
-                        f"Solid Candle: `{is_solid}`\n\n"
-                        f"Bot active hai aur calculation loop 100% chal raha hai!"
+                print(f"[{sym}] Checked! Close: {curr_close}, Trend: {trend_state[-1]}, EMA: {curr_ema:.2f}", flush=True)
+
+                # IMMEDIATE TEST ALERT ON STARTUP
+                if not test_alert_done[sym]:
+                    test_alert_done[sym] = True
+                    last_processed_candle_time[sym] = closed_time
+                    state_str = "BULLISH 🟢" if trend_state[-1] == 1 else "BEARISH 🔴"
+                    test_msg = (
+                        f"🧪 *INSTANT TEST CONFIRMATION*\n\n"
+                        f"Coin: `#{sym}`\n"
+                        f"Last Closed Price: `${curr_close:.2f}`\n"
+                        f"Trend State: `{state_str}`\n"
+                        f"EMA 50: `${curr_ema:.2f}`\n\n"
+                        f"✅ Loop active hai aur 15m data successfully compute ho raha hai!"
                     )
-                    send_telegram(diag_msg)
-                    log(f"Initial diagnostic sent for {sym}")
+                    send_telegram(test_msg)
 
-                # Check if this candle is already processed
-                if last_processed_candle_time[sym] == closed_time:
-                    continue
-
-                trend_flipped_bull = (trend_state[-1] == 1 and trend_state[-2] == -1)
-                trend_flipped_bear = (trend_state[-1] == -1 and trend_state[-2] == 1)
-
+                # 9. Real Pine Script Signal Conditions
                 raw_buy = trend_flipped_bull and (swept_low or curr_close > curr_ema) and is_exp and is_solid
                 raw_sell = trend_flipped_bear and (swept_high or curr_close < curr_ema) and is_exp and is_solid
 
@@ -204,10 +211,9 @@ def run_strategy():
                         f"Coin: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
                         f"Timeframe: `15m`\n"
-                        f"Status: Trend Flip + Validated"
+                        f"Validation: Trend Flip Bull + Pine Conditions Met"
                     )
                     send_telegram(msg)
-                    log(f"BUY Signal sent for {sym}")
 
                 elif sell_condition:
                     positions[sym] = -1
@@ -216,16 +222,14 @@ def run_strategy():
                         f"Coin: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
                         f"Timeframe: `15m`\n"
-                        f"Status: Trend Flip + Validated"
+                        f"Validation: Trend Flip Bear + Pine Conditions Met"
                     )
                     send_telegram(msg)
-                    log(f"SELL Signal sent for {sym}")
 
                 last_processed_candle_time[sym] = closed_time
-                log(f"Processed candle {closed_time} for {sym}")
 
             except Exception as err:
-                log(f"Loop Exception for {sym}: {err}")
+                print(f"Loop Exception for {sym}: {err}", flush=True)
 
             time.sleep(1)
 
