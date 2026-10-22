@@ -10,10 +10,12 @@ import numpy as np
 TELEGRAM_BOT_TOKEN = "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA"
 TELEGRAM_CHAT_ID   = "6470999168"
 
-# Delta Exchange Symbols
-SYMBOLS    = ["BTCUSD", "ETHUSD"]
-TIMEFRAME  = "15m"  # Delta resolution: 15m, 1d
+SYMBOLS = [
+    {"delta": "BTCUSD", "binance": "BTCUSDT"},
+    {"delta": "ETHUSD", "binance": "ETHUSDT"}
+]
 
+# Pine Script Inputs
 SWING_LEN  = 20
 ATR_PERIOD = 14
 ATR_MULT   = 2.4
@@ -25,7 +27,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Delta Sniper Engine 24/7 LIVE")
+        self.wfile.write(b"Crypto Sniper 24/7 LIVE")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -46,28 +48,53 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
 
-# Delta Exchange Candle Fetcher (100% Free Public API)
-def fetch_delta_klines(symbol, resolution="15m", limit=120):
+def fetch_klines(sym_dict, timeframe="15m", limit=120):
+    delta_sym = sym_dict["delta"]
+    binance_sym = sym_dict["binance"]
     now = int(time.time())
-    # 15m = 900 seconds per candle
-    sec_per_bar = 86400 if resolution == "1d" else 900
-    start_time = now - (limit * sec_per_bar)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # 1. Try Delta Exchange API
+    res_code = "1D" if timeframe == "1d" else "15"
+    sec_per_bar = 86400 if timeframe == "1d" else 900
+    from_time = now - (limit * sec_per_bar)
     
-    url = f"https://api.delta.exchange/v2/chart/history?symbol={symbol}&resolution={resolution}&from={start_time}&to={now}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
+    delta_url = f"https://api.delta.exchange/v2/chart/history?symbol={delta_sym}&resolution={res_code}&from={from_time}&to={now}"
     try:
-        res = requests.get(url, headers=headers, timeout=8).json()
-        if res.get("success") and res.get("result"):
-            data = res["result"]
-            df = pd.DataFrame(data)
-            # Delta returns: time, open, high, low, close, volume
-            df = df.sort_values("time").reset_index(drop=True)
-            for col in ['open', 'high', 'low', 'close']:
-                df[col] = df[col].astype(float)
-            return df
-    except Exception as e:
-        print(f"Delta API Error for {symbol}: {e}", flush=True)
+        r = requests.get(delta_url, headers=headers, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success") and data.get("result") and len(data["result"]) >= 50:
+                df = pd.DataFrame(data["result"])
+                df = df.sort_values("time").reset_index(drop=True)
+                for col in ['open', 'high', 'low', 'close']:
+                    df[col] = df[col].astype(float)
+                return df
+    except Exception:
+        pass
+
+    # 2. Resilient Binance Mirrors (Fallback)
+    mirrors = [
+        f"https://data-api.binance.vision/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={limit}",
+        f"https://api.binance.com/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={limit}",
+        f"https://api1.binance.com/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={limit}"
+    ]
+    for m_url in mirrors:
+        try:
+            r = requests.get(m_url, headers=headers, timeout=5)
+            if r.status_code == 200:
+                candles = r.json()
+                if isinstance(candles, list) and len(candles) >= 50:
+                    df = pd.DataFrame(candles, columns=[
+                        'time', 'open', 'high', 'low', 'close', 'volume',
+                        'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+                    ])
+                    for col in ['open', 'high', 'low', 'close']:
+                        df[col] = df[col].astype(float)
+                    return df
+        except Exception:
+            continue
+
     return pd.DataFrame()
 
 def rma(series, length):
@@ -75,25 +102,20 @@ def rma(series, length):
     return series.ewm(alpha=alpha, adjust=False).mean()
 
 def run_strategy():
-    positions = {sym: 0 for sym in SYMBOLS}
-    last_processed_candle_time = {sym: None for sym in SYMBOLS}
-    test_alert_done = {sym: False for sym in SYMBOLS}
+    positions = {s["delta"]: 0 for s in SYMBOLS}
+    last_processed_candle_time = {s["delta"]: None for s in SYMBOLS}
+    test_alert_done = {s["delta"]: False for s in SYMBOLS}
 
-    print(">>> Delta Exchange Sniper Engine Started <<<", flush=True)
-    send_telegram(
-        "⚡ *Delta Exchange Sniper Engine Active!*\n\n"
-        "DataSource: `Delta Exchange API`\n"
-        "Pairs: `BTCUSD, ETHUSD`\n"
-        "Status: Connecting to candles..."
-    )
+    print(">>> Strategy Engine Started <<<", flush=True)
 
     while True:
-        for sym in SYMBOLS:
+        for sym_dict in SYMBOLS:
+            sym = sym_dict["delta"]
             try:
                 # 1. Fetch 15m Candles
-                df = fetch_delta_klines(sym, resolution="15m", limit=120)
+                df = fetch_klines(sym_dict, timeframe="15m", limit=120)
                 if df.empty or len(df) < 50:
-                    print(f"[{sym}] Waiting for Delta data...", flush=True)
+                    print(f"[{sym}] Fetching feed retry...", flush=True)
                     continue
 
                 closed_candle = df.iloc[-2]
@@ -107,7 +129,7 @@ def run_strategy():
                 n = len(cdf)
 
                 # 2. Fetch Daily PDH / PDL
-                daily_df = fetch_delta_klines(sym, resolution="1d", limit=4)
+                daily_df = fetch_klines(sym_dict, timeframe="1d", limit=4)
                 if not daily_df.empty and len(daily_df) >= 2:
                     pdh = daily_df.iloc[-2]['high']
                     pdl = daily_df.iloc[-2]['low']
@@ -183,7 +205,7 @@ def run_strategy():
                 is_exp = bool(cdf['is_expanded'].iloc[-1])
                 is_solid = bool(cdf['solid_candle'].iloc[-1])
 
-                print(f"[{sym}] Checked! Close: {curr_close:.2f}, Trend: {trend_state[-1]}", flush=True)
+                print(f"[{sym}] Processed! Close: {curr_close:.2f}, Trend: {trend_state[-1]}", flush=True)
 
                 # Instant Test Alert on Startup
                 if not test_alert_done[sym]:
@@ -191,16 +213,16 @@ def run_strategy():
                     last_processed_candle_time[sym] = closed_time
                     state_str = "BULLISH 🟢" if trend_state[-1] == 1 else "BEARISH 🔴"
                     test_msg = (
-                        f"🧪 *DELTA EXCHANGE TEST ALERT*\n\n"
+                        f"🧪 *DATA CONNECTED TEST ALERT*\n\n"
                         f"Coin: `#{sym}`\n"
                         f"Last Close: `${curr_close:.2f}`\n"
                         f"Trend: `{state_str}`\n"
                         f"EMA 50: `${curr_ema:.2f}`\n\n"
-                        f"✅ Delta Exchange connection 100% active!"
+                        f"✅ Data feed sync ho chuki hai! Pine Script logic actively running."
                     )
                     send_telegram(test_msg)
 
-                # 8. Real Signals
+                # 8. Real TradingView Parity Signals
                 raw_buy = trend_flipped_bull and (swept_low or curr_close > curr_ema) and is_exp and is_solid
                 raw_sell = trend_flipped_bear and (swept_high or curr_close < curr_ema) and is_exp and is_solid
 
@@ -210,7 +232,7 @@ def run_strategy():
                 if buy_condition:
                     positions[sym] = 1
                     send_telegram(
-                        f"🟢 *SNIPER BUY ALERT (DELTA)*\n\n"
+                        f"🟢 *SNIPER BUY ALERT!*\n\n"
                         f"Coin: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
                         f"Timeframe: `15m`"
@@ -219,7 +241,7 @@ def run_strategy():
                 elif sell_condition:
                     positions[sym] = -1
                     send_telegram(
-                        f"🔴 *SNIPER SELL ALERT (DELTA)*\n\n"
+                        f"🔴 *SNIPER SELL ALERT!*\n\n"
                         f"Coin: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
                         f"Timeframe: `15m`"
@@ -232,7 +254,7 @@ def run_strategy():
 
             time.sleep(1)
 
-        time.sleep(12)
+        time.sleep(10)
 
 if __name__ == "__main__":
     server_thread = threading.Thread(target=start_health_server, daemon=True)
