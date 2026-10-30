@@ -15,12 +15,16 @@ SYMBOLS = [
     {"delta": "ETHUSD", "binance": "ETHUSDT"}
 ]
 
-# Pine Script Inputs
+# Timeframe & Deep Historical Buffer
+TIMEFRAME  = "15m"
+LIMIT_BARS = 1000
+
+# Strategy Parameters
 SWING_LEN  = 20
 ATR_PERIOD = 14
-ATR_MULT   = 2.4
+ATR_MULT   = 2.0       # Optimized from 2.4 for faster reversal capture
 EMA_LEN    = 50
-MIN_BODY   = 0.60
+MIN_BODY   = 0.55
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -48,23 +52,24 @@ def send_telegram(message):
     except Exception as e:
         print(f"Telegram error: {e}", flush=True)
 
-def fetch_klines(sym_dict, timeframe="15m", limit=120):
+def fetch_klines(sym_dict, timeframe="15m", limit=1000):
     delta_sym = sym_dict["delta"]
     binance_sym = sym_dict["binance"]
     now = int(time.time())
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # 1. Try Delta Exchange API
+    # 1. Delta Exchange API (Max safe resolution batch is 500 bars)
     res_code = "1D" if timeframe == "1d" else "15"
     sec_per_bar = 86400 if timeframe == "1d" else 900
-    from_time = now - (limit * sec_per_bar)
+    safe_delta_limit = min(limit, 500)
+    from_time = now - (safe_delta_limit * sec_per_bar)
     
     delta_url = f"https://api.delta.exchange/v2/chart/history?symbol={delta_sym}&resolution={res_code}&from={from_time}&to={now}"
     try:
         r = requests.get(delta_url, headers=headers, timeout=6)
         if r.status_code == 200:
             data = r.json()
-            if data.get("success") and data.get("result") and len(data["result"]) >= 50:
+            if data.get("success") and data.get("result") and len(data["result"]) >= 100:
                 df = pd.DataFrame(data["result"])
                 df = df.sort_values("time").reset_index(drop=True)
                 for col in ['open', 'high', 'low', 'close']:
@@ -73,18 +78,18 @@ def fetch_klines(sym_dict, timeframe="15m", limit=120):
     except Exception:
         pass
 
-    # 2. Resilient Binance Mirrors (Fallback)
+    # 2. Resilient Binance Mirrors (1000 Bars Full Buffer)
     mirrors = [
-        f"https://data-api.binance.vision/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={limit}",
-        f"https://api.binance.com/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={limit}",
-        f"https://api1.binance.com/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={limit}"
+        f"https://data-api.binance.vision/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={min(limit, 1000)}",
+        f"https://api.binance.com/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={min(limit, 1000)}",
+        f"https://api1.binance.com/api/v3/klines?symbol={binance_sym}&interval={timeframe}&limit={min(limit, 1000)}"
     ]
     for m_url in mirrors:
         try:
             r = requests.get(m_url, headers=headers, timeout=5)
             if r.status_code == 200:
                 candles = r.json()
-                if isinstance(candles, list) and len(candles) >= 50:
+                if isinstance(candles, list) and len(candles) >= 100:
                     df = pd.DataFrame(candles, columns=[
                         'time', 'open', 'high', 'low', 'close', 'volume',
                         'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
@@ -102,19 +107,27 @@ def rma(series, length):
     return series.ewm(alpha=alpha, adjust=False).mean()
 
 def run_strategy():
-    positions = {s["delta"]: 0 for s in SYMBOLS}
+    active_trades = {
+        s["delta"]: {
+            "side": None,      # 'BUY' or 'SELL'
+            "entry_price": 0.0,
+            "entry_time": 0,
+            "trailing_sl": 0.0
+        } for s in SYMBOLS
+    }
+
     last_processed_candle_time = {s["delta"]: None for s in SYMBOLS}
     test_alert_done = {s["delta"]: False for s in SYMBOLS}
 
-    print(">>> Strategy Engine Started <<<", flush=True)
+    print(">>> Strategy Engine Started (1000 Bars + CHoCH + Trailing SL) <<<", flush=True)
 
     while True:
         for sym_dict in SYMBOLS:
             sym = sym_dict["delta"]
             try:
-                # 1. Fetch 15m Candles
-                df = fetch_klines(sym_dict, timeframe="15m", limit=120)
-                if df.empty or len(df) < 50:
+                # 1. Fetch Deep Candle History
+                df = fetch_klines(sym_dict, timeframe="15m", limit=LIMIT_BARS)
+                if df.empty or len(df) < 150:
                     print(f"[{sym}] Fetching feed retry...", flush=True)
                     continue
 
@@ -129,7 +142,7 @@ def run_strategy():
                 n = len(cdf)
 
                 # 2. Fetch Daily PDH / PDL
-                daily_df = fetch_klines(sym_dict, timeframe="1d", limit=4)
+                daily_df = fetch_klines(sym_dict, timeframe="1d", limit=5)
                 if not daily_df.empty and len(daily_df) >= 2:
                     pdh = daily_df.iloc[-2]['high']
                     pdl = daily_df.iloc[-2]['low']
@@ -145,7 +158,7 @@ def run_strategy():
 
                 cdf['atr'] = rma(tr, ATR_PERIOD)
                 cdf['atr_ma'] = cdf['atr'].rolling(20).mean()
-                cdf['is_expanded'] = cdf['atr'] >= (cdf['atr_ma'] * 0.95)
+                cdf['is_expanded'] = cdf['atr'] >= (cdf['atr_ma'] * 0.92)
 
                 # 4. Solid Candle Body Ratio
                 c_range = cdf['high'] - cdf['low']
@@ -153,7 +166,7 @@ def run_strategy():
                 cdf['solid_candle'] = np.where(c_range > 0, (c_body / c_range) >= MIN_BODY, False)
                 cdf['ema_base'] = cdf['close'].ewm(span=EMA_LEN, adjust=False).mean()
 
-                # 5. Major Swing Pivots
+                # 5. Major Swing Pivots & Genuine CHoCH / MSS Detection
                 highs = cdf['high'].values
                 lows = cdf['low'].values
                 closes = cdf['close'].values
@@ -172,7 +185,16 @@ def run_strategy():
                     major_high[i] = curr_maj_high
                     major_low[i] = curr_maj_low
 
-                # 6. Dynamic Trailing Trend Engine
+                # Extract last confirmed valid swing high and low
+                valid_highs = major_high[~np.isnan(major_high)]
+                valid_lows  = major_low[~np.isnan(major_low)]
+                last_swing_high = valid_highs[-1] if len(valid_highs) > 0 else highs[-2]
+                last_swing_low  = valid_lows[-1] if len(valid_lows) > 0 else lows[-2]
+
+                choch_bull = (closes[-1] > last_swing_high)
+                choch_bear = (closes[-1] < last_swing_low)
+
+                # 6. Dynamic Trailing Trend Engine (ATR Multiplier 2.0)
                 up_trend = np.zeros(n)
                 dn_trend = np.zeros(n)
                 trend_state = np.zeros(n, dtype=int)
@@ -205,7 +227,7 @@ def run_strategy():
                 is_exp = bool(cdf['is_expanded'].iloc[-1])
                 is_solid = bool(cdf['solid_candle'].iloc[-1])
 
-                print(f"[{sym}] Processed! Close: {curr_close:.2f}, Trend: {trend_state[-1]}", flush=True)
+                print(f"[{sym}] Processed! Close: {curr_close:.2f}, Trend: {trend_state[-1]}, EMA: {curr_ema:.2f}", flush=True)
 
                 # Instant Test Alert on Startup
                 if not test_alert_done[sym]:
@@ -213,38 +235,93 @@ def run_strategy():
                     last_processed_candle_time[sym] = closed_time
                     state_str = "BULLISH 🟢" if trend_state[-1] == 1 else "BEARISH 🔴"
                     test_msg = (
-                        f"🧪 *DATA CONNECTED TEST ALERT*\n\n"
+                        f"🧪 *PAPER ENGINE LIVE (VERIFIED)*\n\n"
                         f"Coin: `#{sym}`\n"
                         f"Last Close: `${curr_close:.2f}`\n"
                         f"Trend: `{state_str}`\n"
                         f"EMA 50: `${curr_ema:.2f}`\n\n"
-                        f"✅ Data feed sync ho chuki hai! Pine Script logic actively running."
+                        f"✅ CHoCH/MSS + 50 EMA Trailing Active!"
                     )
                     send_telegram(test_msg)
 
-                # 8. Real TradingView Parity Signals
-                raw_buy = trend_flipped_bull and (swept_low or curr_close > curr_ema) and is_exp and is_solid
-                raw_sell = trend_flipped_bear and (swept_high or curr_close < curr_ema) and is_exp and is_solid
+                # 8. Signals (Pine Parity + CHoCH/MSS Sensitivity)
+                raw_buy = (trend_flipped_bull or choch_bull) and (swept_low or curr_close > curr_ema) and is_exp and is_solid
+                raw_sell = (trend_flipped_bear or choch_bear) and (swept_high or curr_close < curr_ema) and is_exp and is_solid
 
-                buy_condition = (positions[sym] != 1) and raw_buy
-                sell_condition = (positions[sym] != -1) and raw_sell
+                trade = active_trades[sym]
 
-                if buy_condition:
-                    positions[sym] = 1
+                # --- TRAILING SL & EXIT CHECK (RIDE BIG MOVES) ---
+                if trade["side"] == "BUY":
+                    trail_level = max(curr_ema, up_trend[-1])
+                    if trail_level > trade["trailing_sl"]:
+                        trade["trailing_sl"] = trail_level
+
+                    if curr_close < curr_ema or raw_sell:
+                        pnl_pts = curr_close - trade["entry_price"]
+                        pnl_pct = (pnl_pts / trade["entry_price"]) * 100
+                        result_icon = "🟢 PROFIT" if pnl_pts > 0 else "🔴 LOSS"
+                        send_telegram(
+                            f"🏁 *PAPER EXIT (BUY POSITION CLOSED)*\n\n"
+                            f"Coin: `#{sym}`\n"
+                            f"Exit: `${curr_close:.2f}`\n"
+                            f"Entry: `${trade['entry_price']:.2f}`\n"
+                            f"Outcome: *{result_icon}*\n"
+                            f"PnL: `{pnl_pts:+.2f} USDT` (`{pnl_pct:+.2f}%`)\n"
+                            f"Reason: `Opposite Signal / EMA Trail Broken`"
+                        )
+                        trade["side"] = None
+
+                elif trade["side"] == "SELL":
+                    trail_level = min(curr_ema, dn_trend[-1])
+                    if trade["trailing_sl"] == 0 or trail_level < trade["trailing_sl"]:
+                        trade["trailing_sl"] = trail_level
+
+                    if curr_close > curr_ema or raw_buy:
+                        pnl_pts = trade["entry_price"] - curr_close
+                        pnl_pct = (pnl_pts / trade["entry_price"]) * 100
+                        result_icon = "🟢 PROFIT" if pnl_pts > 0 else "🔴 LOSS"
+                        send_telegram(
+                            f"🏁 *PAPER EXIT (SELL POSITION CLOSED)*\n\n"
+                            f"Coin: `#{sym}`\n"
+                            f"Exit: `${curr_close:.2f}`\n"
+                            f"Entry: `${trade['entry_price']:.2f}`\n"
+                            f"Outcome: *{result_icon}*\n"
+                            f"PnL: `{pnl_pts:+.2f} USDT` (`{pnl_pct:+.2f}%`)\n"
+                            f"Reason: `Opposite Signal / EMA Trail Broken`"
+                        )
+                        trade["side"] = None
+
+                # --- NEW TRADE ENTRIES ---
+                if raw_buy and trade["side"] != "BUY":
+                    initial_sl = lows[-1] - (atrs[-1] * 0.5)
+                    trade["side"] = "BUY"
+                    trade["entry_price"] = curr_close
+                    trade["entry_time"] = closed_time
+                    trade["trailing_sl"] = initial_sl
+
                     send_telegram(
-                        f"🟢 *SNIPER BUY ALERT!*\n\n"
+                        f"🟢 *SNIPER BUY ALERT (PAPER TRADE)*\n\n"
                         f"Coin: `#{sym}`\n"
-                        f"Price: `${curr_close:.2f}`\n"
-                        f"Timeframe: `15m`"
+                        f"Entry Price: `${curr_close:.2f}`\n"
+                        f"Initial SL: `${initial_sl:.2f}`\n"
+                        f"Trailing Ref: `50 EMA (${curr_ema:.2f})`\n"
+                        f"Rule: *Holding position until opposite flip / EMA break!*"
                     )
 
-                elif sell_condition:
-                    positions[sym] = -1
+                elif raw_sell and trade["side"] != "SELL":
+                    initial_sl = highs[-1] + (atrs[-1] * 0.5)
+                    trade["side"] = "SELL"
+                    trade["entry_price"] = curr_close
+                    trade["entry_time"] = closed_time
+                    trade["trailing_sl"] = initial_sl
+
                     send_telegram(
-                        f"🔴 *SNIPER SELL ALERT!*\n\n"
+                        f"🔴 *SNIPER SELL ALERT (PAPER TRADE)*\n\n"
                         f"Coin: `#{sym}`\n"
-                        f"Price: `${curr_close:.2f}`\n"
-                        f"Timeframe: `15m`"
+                        f"Entry Price: `${curr_close:.2f}`\n"
+                        f"Initial SL: `${initial_sl:.2f}`\n"
+                        f"Trailing Ref: `50 EMA (${curr_ema:.2f})`\n"
+                        f"Rule: *Holding position until opposite flip / EMA break!*"
                     )
 
                 last_processed_candle_time[sym] = closed_time
@@ -260,3 +337,4 @@ if __name__ == "__main__":
     server_thread = threading.Thread(target=start_health_server, daemon=True)
     server_thread.start()
     run_strategy()
+            
