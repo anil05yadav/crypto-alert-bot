@@ -18,20 +18,19 @@ SYMBOLS = [
 TIMEFRAME  = "15m"
 LIMIT_BARS = 1000
 
-# Exact Finalized TradingView Parameters (20, 14, 2.4, 5, 50, 0.60)
+# Exact Pro Reversal Edition Parameters (20, 14, 1.8, 6, 0.55)
 SWING_LEN  = 20
 ATR_PERIOD = 14
-ATR_MULT   = 2.4
-MIN_BARS   = 5
-EMA_LEN    = 50
-MIN_BODY   = 0.60
+ATR_MULT   = 1.8
+MIN_BARS   = 6
+MIN_BODY   = 0.55
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Trend Liquidity Sniper Bot 24/7 LIVE")
+        self.wfile.write(b"Trend Liquidity Sniper Pro Reversal LIVE")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -56,7 +55,6 @@ def fetch_klines(sym_dict, timeframe="15m", limit=1000):
     delta_sym   = sym_dict["delta"]
     headers     = {"User-Agent": "Mozilla/5.0"}
 
-    # 1. Binance Futures / Spot Mirrors
     binance_interval = "1d" if timeframe == "1d" else "15m"
     mirrors = [
         f"https://fapi.binance.com/fapi/v1/klines?symbol={binance_sym}&interval={binance_interval}&limit={min(limit, 1000)}",
@@ -79,7 +77,6 @@ def fetch_klines(sym_dict, timeframe="15m", limit=1000):
         except Exception:
             continue
 
-    # 2. Delta Exchange Fallback
     now = int(time.time())
     res_code = "1D" if timeframe == "1d" else "15"
     sec_per_bar = 86400 if timeframe == "1d" else 900
@@ -115,7 +112,7 @@ def run_strategy():
     last_processed_candle_time = {s["delta"]: None for s in SYMBOLS}
     initialized = {s["delta"]: False for s in SYMBOLS}
 
-    print(">>> Finalized 1:1 Trend Liquidity Sniper Engine Running <<<", flush=True)
+    print(">>> Pro Reversal Edition (20, 14, 1.8, 6, 0.55) Running <<<", flush=True)
 
     while True:
         for sym_dict in SYMBOLS:
@@ -143,7 +140,7 @@ def run_strategy():
                     pdh = cdf['high'].max()
                     pdl = cdf['low'].min()
 
-                # ATR & Volatility Expansion (0.95 Multiplier)
+                # ATR & Volatility Expansion (0.85 Multiplier)
                 tr1 = cdf['high'] - cdf['low']
                 tr2 = (cdf['high'] - cdf['close'].shift(1)).abs()
                 tr3 = (cdf['low'] - cdf['close'].shift(1)).abs()
@@ -151,19 +148,17 @@ def run_strategy():
 
                 cdf['atr']         = rma(tr, ATR_PERIOD)
                 cdf['atr_ma']      = cdf['atr'].rolling(20).mean()
-                cdf['is_expanded'] = cdf['atr'] >= (cdf['atr_ma'] * 0.95)
+                cdf['is_expanded'] = cdf['atr'] >= (cdf['atr_ma'] * 0.85)
 
                 c_range = cdf['high'] - cdf['low']
                 c_body  = (cdf['close'] - cdf['open']).abs()
                 cdf['solid_candle'] = np.where(c_range > 0, (c_body / c_range) >= MIN_BODY, False)
-                cdf['ema_base']     = cdf['close'].ewm(span=EMA_LEN, adjust=False).mean()
 
                 closes = cdf['close'].values
                 highs  = cdf['high'].values
                 lows   = cdf['low'].values
                 opens  = cdf['open'].values
                 atrs   = cdf['atr'].values
-                emas   = cdf['ema_base'].values
                 solids = cdf['solid_candle'].values
                 exps   = cdf['is_expanded'].values
 
@@ -207,8 +202,8 @@ def run_strategy():
                     p_sell = (highs[i] > pdh or (not np.isnan(major_high) and highs[i] > major_high)) and (closes[i] < opens[i]) and solids[i] and exps[i]
                     t_buy  = (lows[i] < pdl or (not np.isnan(major_low) and lows[i] < major_low)) and (closes[i] > opens[i]) and solids[i] and exps[i]
 
-                    r_buy  = (t_flip_bull and closes[i] > emas[i] and exps[i]) or t_buy
-                    r_sell = (t_flip_bear and closes[i] < emas[i] and exps[i]) or p_sell
+                    r_buy  = t_flip_bull or t_buy
+                    r_sell = t_flip_bear or p_sell
 
                     bars_since_last = i - last_signal_bar
 
@@ -229,7 +224,6 @@ def run_strategy():
                         sell_triggered_last = s_cond
 
                 curr_close = closes[-1]
-                curr_ema   = emas[-1]
                 trade      = active_trades[sym]
 
                 if not initialized[sym]:
@@ -244,12 +238,12 @@ def run_strategy():
 
                     state_str = "BUY (LONG) 🟢" if tv_position == 1 else ("SELL (SHORT) 🔴" if tv_position == -1 else "NEUTRAL")
                     send_telegram(
-                        f"⚡ *SNIPER ENGINE 1:1 FINAL SYNCED*\n\n"
+                        f"⚡ *PRO REVERSAL ENGINE 1:1 SYNCED*\n\n"
                         f"Asset: `#{sym}`\n"
                         f"Price: `${curr_close:.2f}`\n"
                         f"Active TV Position: *{state_str}*\n"
                         f"Last Signal Price: `${last_sig_price:.2f}`\n"
-                        f"Params: `20, 14, 2.4, 5, 50, 0.60`"
+                        f"Params: `20, 14, 1.8, 6, 0.55`"
                     )
                     continue
 
