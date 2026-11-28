@@ -7,8 +7,8 @@ import pandas as pd
 import numpy as np
 
 # ---------------- CONFIGURATION ----------------
-TELEGRAM_BOT_TOKEN = "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA"
-TELEGRAM_CHAT_ID   = "6470999168"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7891331261:AAGk2XL2_4LqIpBwSHwA-5dn2RTrzUbvAnA")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "6470999168")
 
 # Exact TradingView Watchlist Mapping:
 # 1. BTCUSD.P  -> Delta Exchange India (BTCUSD)
@@ -21,22 +21,28 @@ SYMBOLS = [
 TIMEFRAME  = "15m"
 LIMIT_BARS = 1000
 
-# Exact Pine Script Inputs: (20, 50, 200, 14, 2.4, 10, 0.55, 12)
-SWING_LEN  = 20
-FAST_EMA   = 50
-EMA_LEN    = 200
-ATR_PERIOD = 14
-ATR_MULT   = 2.4
-MIN_BARS   = 10
-MIN_BODY   = 0.55
-FVG_LOOK   = 12
+# Exact Locked Pine Script Inputs: Institutional SMC Engine [60-Bar Clean Pro]
+# Params: (12, 5, 60, 12, 1.25, 0.50)
+SWING_LEN     = 12
+IDM_LEN       = 5
+ZONE_LIFE     = 60
+COOLDOWN      = 12
+VOL_MULT      = 1.25
+MIN_BODY      = 0.50
+GIANT_BAR_PCT = 0.015   # >1.5% single 15m candle -> 50% Pullback Limit Alert
+
+# Smart Risk & Profit Protection Alert Thresholds
+MAX_SL_PCT      = 0.012 # 1.2% Max Stop Loss
+BREAKEVEN_TRIG  = 0.012 # +1.2% Move -> Breakeven Alert
+TRAIL_START_PCT = 0.022 # +2.2% Move -> Trailing Profit Lock Active
+TRAIL_GAP_PCT   = 0.008 # 0.8% Trailing Gap from Peak
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"SMC Pullback & Reversal Pro LIVE")
+        self.wfile.write(b"Institutional SMC Engine [60-Bar Clean Pro] LIVE")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -77,7 +83,10 @@ def fetch_delta_klines(symbol, timeframe="15m", limit=1000):
                     df = pd.DataFrame(data["result"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
                     for col in ['open', 'high', 'low', 'close']:
                         df[col] = df[col].astype(float)
-                    # Convert Delta seconds timestamp to milliseconds for consistency
+                    if 'volume' in df.columns:
+                        df['volume'] = df['volume'].astype(float)
+                    else:
+                        df['volume'] = 0.0
                     if df['time'].iloc[-1] < 1e11:
                         df['time'] = df['time'] * 1000
                     return df
@@ -103,7 +112,7 @@ def fetch_binance_klines(symbol, timeframe="15m", limit=1000):
                         'time', 'open', 'high', 'low', 'close', 'volume',
                         'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
                     ])
-                    for col in ['open', 'high', 'low', 'close']:
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
                         df[col] = df[col].astype(float)
                     return df
         except Exception:
@@ -122,49 +131,22 @@ def fetch_klines(sym_cfg, timeframe="15m", limit=1000):
             return df
         return fetch_delta_klines("ETHUSD", timeframe, limit)
 
-def rma(series, length):
-    alpha = 1.0 / length
-    return series.ewm(alpha=alpha, adjust=False).mean()
-
-def calc_rsi(series, length=14):
-    delta    = series.diff()
-    gain     = delta.clip(lower=0)
-    loss     = -delta.clip(upper=0)
-    avg_gain = rma(gain, length)
-    avg_loss = rma(loss, length)
-    rs       = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def build_daily_pdh_pdl(cdf, daily_df):
-    """Exact replica of Pine Script request.security(..., 'D', [high[1], low[1]], lookahead=on)"""
-    cdf['date_str'] = pd.to_datetime(cdf['time'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-    if not daily_df.empty and len(daily_df) >= 2:
-        ddf = daily_df.copy()
-        ddf['date_str'] = pd.to_datetime(ddf['time'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
-        ddf['prev_high'] = ddf['high'].shift(1)
-        ddf['prev_low']  = ddf['low'].shift(1)
-        pdh_map = dict(zip(ddf['date_str'], ddf['prev_high']))
-        pdl_map = dict(zip(ddf['date_str'], ddf['prev_low']))
-        pdh_arr = cdf['date_str'].map(pdh_map).ffill().bfill().values
-        pdl_arr = cdf['date_str'].map(pdl_map).ffill().bfill().values
-    else:
-        pdh_arr = np.full(len(cdf), cdf['high'].max())
-        pdl_arr = np.full(len(cdf), cdf['low'].min())
-    return pdh_arr, pdl_arr
-
 def run_strategy():
     active_trades = {
         s["tv_name"]: {
             "side": None,
             "entry_price": 0.0,
-            "sl_level": 0.0
+            "sl_level": 0.0,
+            "peak_price": 0.0,
+            "be_alerted": False,
+            "trail_active": False
         } for s in SYMBOLS
     }
 
     last_processed_candle_time = {s["tv_name"]: None for s in SYMBOLS}
     initialized = {s["tv_name"]: False for s in SYMBOLS}
 
-    print(">>> SMC Pullback & Reversal Pro (BTCUSD.P Delta + ETHUSDT.P Binance) LIVE <<<", flush=True)
+    print(">>> Institutional SMC Engine [60-Bar Clean Pro] (BTCUSD.P + ETHUSDT.P) LIVE <<<", flush=True)
 
     while True:
         for sym_cfg in SYMBOLS:
@@ -174,180 +156,262 @@ def run_strategy():
                 if df.empty or len(df) < 250:
                     continue
 
+                live_price    = float(df.iloc[-1]['close'])
                 closed_candle = df.iloc[-2]
                 closed_time   = closed_candle['time']
+                trade         = active_trades[tv_name]
 
+                # --------------------------------------------------------------
+                # A) LIVE SL / BREAKEVEN / TRAILING PROFIT MONITOR (EVERY 10s)
+                # --------------------------------------------------------------
+                if initialized[tv_name] and trade["side"] in ("BUY", "SELL"):
+                    if trade["side"] == "BUY":
+                        if live_price > trade["peak_price"]:
+                            trade["peak_price"] = live_price
+                        move_pct = (trade["peak_price"] - trade["entry_price"]) / trade["entry_price"]
+
+                        if move_pct >= BREAKEVEN_TRIG and not trade["be_alerted"]:
+                            trade["sl_level"] = trade["entry_price"] * 1.001
+                            trade["be_alerted"] = True
+                            send_telegram(
+                                f"🛡️ BREAKEVEN LOCKED (#{tv_name} BUY)\n\n"
+                                f"Price moved +1.2%! Move your SL to Entry:\n"
+                                f"New Safe SL: ${trade['sl_level']:.2f}"
+                            )
+
+                        if move_pct >= TRAIL_START_PCT:
+                            trade["trail_active"] = True
+                            new_trail = trade["peak_price"] * (1 - TRAIL_GAP_PCT)
+                            if new_trail > trade["sl_level"]:
+                                trade["sl_level"] = new_trail
+
+                        if live_price <= trade["sl_level"]:
+                            pnl_pts = live_price - trade["entry_price"]
+                            pnl_pct = (pnl_pts / trade["entry_price"]) * 100
+                            reason  = "TRAILING PROFIT LOCK HIT 💰" if trade["trail_active"] else ("BREAKEVEN EXIT 🛡️" if trade["be_alerted"] else "MAX SL HIT 🛑")
+                            send_telegram(
+                                f"🏁 BUY TRADE CLOSED ({reason})\n\n"
+                                f"Asset: #{tv_name}\n"
+                                f"Exit: ${live_price:.2f} | Entry: ${trade['entry_price']:.2f}\n"
+                                f"Result: {pnl_pts:+.2f} USDT ({pnl_pct:+.2f}%)"
+                            )
+                            trade["side"] = None
+
+                    elif trade["side"] == "SELL":
+                        if live_price < trade["peak_price"]:
+                            trade["peak_price"] = live_price
+                        move_pct = (trade["entry_price"] - trade["peak_price"]) / trade["entry_price"]
+
+                        if move_pct >= BREAKEVEN_TRIG and not trade["be_alerted"]:
+                            trade["sl_level"] = trade["entry_price"] * 0.999
+                            trade["be_alerted"] = True
+                            send_telegram(
+                                f"🛡️ BREAKEVEN LOCKED (#{tv_name} SELL)\n\n"
+                                f"Price moved +1.2%! Move your SL to Entry:\n"
+                                f"New Safe SL: ${trade['sl_level']:.2f}"
+                            )
+
+                        if move_pct >= TRAIL_START_PCT:
+                            trade["trail_active"] = True
+                            new_trail = trade["peak_price"] * (1 + TRAIL_GAP_PCT)
+                            if new_trail < trade["sl_level"]:
+                                trade["sl_level"] = new_trail
+
+                        if live_price >= trade["sl_level"]:
+                            pnl_pts = trade["entry_price"] - live_price
+                            pnl_pct = (pnl_pts / trade["entry_price"]) * 100
+                            reason  = "TRAILING PROFIT LOCK HIT 💰" if trade["trail_active"] else ("BREAKEVEN EXIT 🛡️" if trade["be_alerted"] else "MAX SL HIT 🛑")
+                            send_telegram(
+                                f"🏁 SELL TRADE CLOSED ({reason})\n\n"
+                                f"Asset: #{tv_name}\n"
+                                f"Exit: ${live_price:.2f} | Entry: ${trade['entry_price']:.2f}\n"
+                                f"Result: {pnl_pts:+.2f} USDT ({pnl_pct:+.2f}%)"
+                            )
+                            trade["side"] = None
+
+                # Skip heavy calculation if no new 15m candle has closed yet
                 if initialized[tv_name] and last_processed_candle_time[tv_name] == closed_time:
                     continue
 
+                # --------------------------------------------------------------
+                # B) EXACT 1:1 PINE SCRIPT ENGINE [60-BAR CLEAN PRO]
+                # --------------------------------------------------------------
                 cdf = df.iloc[:-1].copy().reset_index(drop=True)
                 n   = len(cdf)
 
-                # Date-aligned PDH / PDL (Exact Pine Script request.security match)
-                daily_df = fetch_klines(sym_cfg, timeframe="1d", limit=30)
-                pdh_arr, pdl_arr = build_daily_pdh_pdl(cdf, daily_df)
-
-                # Indicators (Exact TradingView Match)
-                cdf['macro_ema'] = cdf['close'].ewm(span=EMA_LEN, adjust=False).mean()
-                cdf['value_ema'] = cdf['close'].ewm(span=FAST_EMA, adjust=False).mean()
-                cdf['rsi']       = calc_rsi(cdf['close'], 14)
-
-                tr1 = cdf['high'] - cdf['low']
-                tr2 = (cdf['high'] - cdf['close'].shift(1)).abs()
-                tr3 = (cdf['low'] - cdf['close'].shift(1)).abs()
-                tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-                cdf['atr'] = rma(tr, ATR_PERIOD)
+                cdf['macro_ema'] = cdf['close'].ewm(span=200, adjust=False).mean()
+                cdf['vol_sma']   = cdf['volume'].rolling(20).mean()
 
                 c_range = cdf['high'] - cdf['low']
                 c_body  = (cdf['close'] - cdf['open']).abs()
-                cdf['solid_candle'] = np.where(c_range > 0, (c_body / c_range) >= MIN_BODY, False)
+                cdf['solid_bar']    = np.where(c_range > 0, (c_body / c_range) >= MIN_BODY, False)
+                cdf['is_giant_bar'] = np.where(cdf['open'] > 0, (c_range / cdf['open']) >= GIANT_BAR_PCT, False)
 
                 closes    = cdf['close'].values
                 highs     = cdf['high'].values
                 lows      = cdf['low'].values
                 opens     = cdf['open'].values
+                volumes   = cdf['volume'].values
                 macro_ema = cdf['macro_ema'].values
-                value_ema = cdf['value_ema'].values
-                rsis      = cdf['rsi'].values
-                atrs      = cdf['atr'].values
-                solids    = cdf['solid_candle'].values
+                vol_sma   = cdf['vol_sma'].values
+                solids    = cdf['solid_bar'].values
+                giants    = cdf['is_giant_bar'].values
 
-                # Exact Historical Simulation Bar-by-Bar
-                up_trend        = np.zeros(n)
-                dn_trend        = np.zeros(n)
-                trend_state     = np.zeros(n, dtype=int)
+                bsl_level      = np.nan
+                ssl_level      = np.nan
+                last_idm_high  = np.nan
+                last_idm_low   = np.nan
+                bull_idm_swept = False
+                bear_idm_swept = False
 
-                tv_position     = 0
-                last_signal_bar = 0
-                last_sig_price  = np.nan
-                major_high      = np.nan
-                major_low       = np.nan
+                bull_ob_top = np.nan
+                bull_ob_bot = np.nan
+                bull_ob_bar = -999
 
-                last_bull_fvg_bot = np.nan
-                last_bull_fvg_bar = -999
-                last_bear_fvg_top = np.nan
-                last_bear_fvg_bar = -999
+                bear_ob_top = np.nan
+                bear_ob_bot = np.nan
+                bear_ob_bar = -999
 
+                tv_position         = 0
+                last_sig_bar        = -999
+                last_sig_price      = np.nan
                 prev_sig_price      = np.nan
                 buy_triggered_last  = False
                 sell_triggered_last = False
 
                 for i in range(2, n):
-                    # Lagged Swing Pivots: ta.pivothigh(high, 20, 20)
+                    # Major Swing Pivots (swing_len = 12)
                     if i >= SWING_LEN * 2:
                         piv_idx = i - SWING_LEN
                         if highs[piv_idx] == np.max(highs[piv_idx - SWING_LEN : piv_idx + SWING_LEN + 1]):
-                            major_high = highs[piv_idx]
+                            bsl_level = highs[piv_idx]
                         if lows[piv_idx] == np.min(lows[piv_idx - SWING_LEN : piv_idx + SWING_LEN + 1]):
-                            major_low = lows[piv_idx]
+                            ssl_level = lows[piv_idx]
 
-                    # 3-Candle FVG Detection
-                    bull_fvg_new = (lows[i] > highs[i-2]) and (closes[i-1] > opens[i-1])
-                    bear_fvg_new = (highs[i] < lows[i-2]) and (closes[i-1] < opens[i-1])
+                    # Internal Inducement Pivots (idm_len = 5)
+                    if i >= IDM_LEN * 2:
+                        idm_idx = i - IDM_LEN
+                        if highs[idm_idx] == np.max(highs[idm_idx - IDM_LEN : idm_idx + IDM_LEN + 1]):
+                            last_idm_high  = highs[idm_idx]
+                            bear_idm_swept = False
+                        if lows[idm_idx] == np.min(lows[idm_idx - IDM_LEN : idm_idx + IDM_LEN + 1]):
+                            last_idm_low   = lows[idm_idx]
+                            bull_idm_swept = False
 
-                    if bull_fvg_new:
-                        last_bull_fvg_bot = highs[i-2]
-                        last_bull_fvg_bar = i
-                    if bear_fvg_new:
-                        last_bear_fvg_top = lows[i-2]
-                        last_bear_fvg_bar = i
+                    if not np.isnan(last_idm_low) and lows[i] < last_idm_low:
+                        bull_idm_swept = True
+                    if not np.isnan(last_idm_high) and highs[i] > last_idm_high:
+                        bear_idm_swept = True
 
-                    has_bull_fvg = (i - last_bull_fvg_bar) <= FVG_LOOK
-                    has_bear_fvg = (i - last_bear_fvg_bar) <= FVG_LOOK
+                    # 60-Bar Dealing Range (Premium / Discount)
+                    win_start   = max(0, i - ZONE_LIFE + 1)
+                    fib_high    = np.max(highs[win_start : i + 1])
+                    fib_low     = np.min(lows[win_start : i + 1])
+                    fib_mid     = (fib_high + fib_low) * 0.5
+                    in_discount = closes[i] <= fib_mid
+                    in_premium  = closes[i] >= fib_mid
+                    valid_range = ((fib_high - fib_low) / fib_low >= 0.012) if fib_low > 0 else False
 
-                    # Inversion FVG (IFVG)
-                    bear_ifvg = (not np.isnan(last_bull_fvg_bot)) and ((i - last_bull_fvg_bar) <= FVG_LOOK * 2) and (closes[i] < last_bull_fvg_bot) and (closes[i-1] >= last_bull_fvg_bot)
-                    bull_ifvg = (not np.isnan(last_bear_fvg_top)) and ((i - last_bear_fvg_bar) <= FVG_LOOK * 2) and (closes[i] > last_bear_fvg_top) and (closes[i-1] <= last_bear_fvg_top)
+                    # Volume Spike Check
+                    has_vol_data = (not np.isnan(vol_sma[i])) and (vol_sma[i] > 0)
+                    high_vol     = (volumes[i] >= vol_sma[i] * VOL_MULT or volumes[i - 1] >= vol_sma[i] * VOL_MULT) if has_vol_data else True
 
-                    # Pullback Zone & OB Rejection
-                    touched_res_zone = (highs[i] >= value_ema[i] or highs[i] >= macro_ema[i]) and (closes[i] < value_ema[i])
-                    touched_sup_zone = (lows[i] <= value_ema[i] or lows[i] <= macro_ema[i]) and (closes[i] > value_ema[i])
+                    # Unmitigated Order Block & FVG Engine (60-Bar Memory)
+                    bull_fvg = (lows[i] > highs[i - 2]) and (closes[i - 1] > opens[i - 1])
+                    bear_fvg = (highs[i] < lows[i - 2]) and (closes[i - 1] < opens[i - 1])
 
-                    bear_ob_reject = (highs[i] > pdh_arr[i] or (not np.isnan(major_high) and highs[i] > major_high) or touched_res_zone) and (closes[i] < opens[i]) and solids[i]
-                    bull_ob_reject = (lows[i] < pdl_arr[i] or (not np.isnan(major_low) and lows[i] < major_low) or touched_sup_zone) and (closes[i] > opens[i]) and solids[i]
+                    if bull_fvg:
+                        bull_ob_top = max(highs[i - 2], opens[i - 2])
+                        bull_ob_bot = min(lows[i - 2], lows[i - 1])
+                        bull_ob_bar = i
 
-                    # Trailing Stop Engine
-                    src_up = closes[i] - (ATR_MULT * atrs[i])
-                    src_dn = closes[i] + (ATR_MULT * atrs[i])
+                    if bear_fvg:
+                        bear_ob_top = max(highs[i - 2], highs[i - 1])
+                        bear_ob_bot = min(lows[i - 2], opens[i - 2])
+                        bear_ob_bar = i
 
-                    up_trend[i] = max(src_up, up_trend[i-1]) if closes[i-1] > up_trend[i-1] else src_up
-                    dn_trend[i] = min(src_dn, dn_trend[i-1]) if closes[i-1] < dn_trend[i-1] else src_dn
+                    bull_rfvg = (not np.isnan(bear_ob_top)) and ((i - bear_ob_bar) <= ZONE_LIFE) and (closes[i] > bear_ob_top) and (closes[i - 1] <= bear_ob_top)
+                    bear_rfvg = (not np.isnan(bull_ob_bot)) and ((i - bull_ob_bar) <= ZONE_LIFE) and (closes[i] < bull_ob_bot) and (closes[i - 1] >= bull_ob_bot)
 
-                    if closes[i] > dn_trend[i-1]:
-                        trend_state[i] = 1
-                    elif closes[i] < up_trend[i-1]:
-                        trend_state[i] = -1
-                    else:
-                        trend_state[i] = trend_state[i-1]
+                    bull_ob_active = (not np.isnan(bull_ob_top)) and (2 <= (i - bull_ob_bar) <= ZONE_LIFE)
+                    bear_ob_active = (not np.isnan(bear_ob_bot)) and (2 <= (i - bear_ob_bar) <= ZONE_LIFE)
 
-                    bars_since_last    = i - last_signal_bar
-                    price_moved_enough = True if np.isnan(last_sig_price) else (abs(closes[i] - last_sig_price) / last_sig_price) >= 0.015
+                    tapped_bull_ob = bull_ob_active and (lows[i] <= bull_ob_top) and (closes[i] >= bull_ob_bot)
+                    tapped_bear_ob = bear_ob_active and (highs[i] >= bear_ob_bot) and (closes[i] <= bear_ob_top)
 
-                    if tv_position == 1 and trend_state[i] == -1 and bars_since_last >= 16 and price_moved_enough:
-                        tv_position = 0
-                    if tv_position == -1 and trend_state[i] == 1 and bars_since_last >= 16 and price_moved_enough:
-                        tv_position = 0
+                    ssl_sweep_buy  = (not np.isnan(ssl_level)) and (lows[i] < ssl_level) and (closes[i] > ssl_level) and (closes[i] > opens[i])
+                    bsl_sweep_sell = (not np.isnan(bsl_level)) and (highs[i] > bsl_level) and (closes[i] < bsl_level) and (closes[i] < opens[i])
 
-                    macro_bull = closes[i] > (macro_ema[i] * 1.002)
-                    macro_bear = closes[i] < (macro_ema[i] * 0.998)
+                    # Clean Strict Alternating Triggers
+                    can_fire      = ((i - last_sig_bar) >= COOLDOWN) and valid_range
+                    ob_buy_valid  = (bull_idm_swept or in_discount) if closes[i] > macro_ema[i] else (bull_idm_swept and high_vol)
+                    ob_sell_valid = (bear_idm_swept or in_premium)  if closes[i] < macro_ema[i] else (bear_idm_swept and high_vol)
 
-                    trend_sell = macro_bear and bear_ob_reject and (has_bear_fvg or bear_ifvg)
-                    trend_buy  = macro_bull and bull_ob_reject and (has_bull_fvg or bull_ifvg)
+                    buy_setup_ob   = tapped_bull_ob and ob_buy_valid and (closes[i] > opens[i]) and solids[i]
+                    buy_setup_liq  = ssl_sweep_buy and solids[i] and high_vol
+                    buy_setup_rfvg = bull_rfvg and high_vol and solids[i]
 
-                    rsi_win           = rsis[max(0, i-14):i+1]
-                    recent_oversold   = np.nanmin(rsi_win) < 32 if len(rsi_win) > 0 else False
-                    recent_overbought = np.nanmax(rsi_win) > 68 if len(rsi_win) > 0 else False
+                    sell_setup_ob   = tapped_bear_ob and ob_sell_valid and (closes[i] < opens[i]) and solids[i]
+                    sell_setup_liq  = bsl_sweep_sell and solids[i] and high_vol
+                    sell_setup_rfvg = bear_rfvg and high_vol and solids[i]
 
-                    bounce_buy  = macro_bear and recent_oversold   and (closes[i] > value_ema[i]) and (closes[i-1] > value_ema[i-1]) and (has_bull_fvg or bull_ifvg) and solids[i]
-                    bounce_sell = macro_bull and recent_overbought and (closes[i] < value_ema[i]) and (closes[i-1] < value_ema[i-1]) and (has_bear_fvg or bear_ifvg) and solids[i]
-
-                    b_cond = (tv_position != 1)  and (trend_buy or bounce_buy)   and (bars_since_last >= MIN_BARS)
-                    s_cond = (tv_position != -1) and (trend_sell or bounce_sell) and (bars_since_last >= MIN_BARS)
+                    b_cond = (tv_position != 1)  and can_fire and (buy_setup_ob or buy_setup_liq or buy_setup_rfvg)
+                    s_cond = (tv_position != -1) and can_fire and (sell_setup_ob or sell_setup_liq or sell_setup_rfvg)
 
                     if b_cond:
                         if i == n - 1:
                             prev_sig_price = last_sig_price
-                        tv_position     = 1
-                        last_signal_bar = i
-                        last_sig_price  = closes[i]
+                        tv_position    = 1
+                        last_sig_bar   = i
+                        last_sig_price = closes[i]
+                        bull_idm_swept = False
+
                     if s_cond:
                         if i == n - 1:
                             prev_sig_price = last_sig_price
-                        tv_position     = -1
-                        last_signal_bar = i
-                        last_sig_price  = closes[i]
+                        tv_position    = -1
+                        last_sig_bar   = i
+                        last_sig_price = closes[i]
+                        bear_idm_swept = False
 
                     if i == n - 1:
                         buy_triggered_last  = b_cond
                         sell_triggered_last = s_cond
 
                 curr_close = closes[-1]
-                trade      = active_trades[tv_name]
+                is_giant   = bool(giants[-1])
 
-                # Startup Sync (Never skips if latest candle just triggered a signal!)
+                # Startup Sync
                 if not initialized[tv_name]:
                     initialized[tv_name] = True
                     last_processed_candle_time[tv_name] = closed_time
                     if tv_position == 1:
                         trade["side"] = "BUY"
                         trade["entry_price"] = last_sig_price
+                        trade["peak_price"]  = last_sig_price
+                        trade["sl_level"]    = last_sig_price * (1 - MAX_SL_PCT)
                     elif tv_position == -1:
                         trade["side"] = "SELL"
                         trade["entry_price"] = last_sig_price
+                        trade["peak_price"]  = last_sig_price
+                        trade["sl_level"]    = last_sig_price * (1 + MAX_SL_PCT)
 
                     state_str = "BUY (LONG) 🟢" if tv_position == 1 else ("SELL (SHORT) 🔴" if tv_position == -1 else "NEUTRAL")
                     sig_p_str = f"${last_sig_price:.2f}" if not np.isnan(last_sig_price) else "N/A"
                     send_telegram(
-                        f"⚡ SMC PULLBACK & REVERSAL PRO SYNCED\n\n"
+                        f"⚡ INSTITUTIONAL SMC ENGINE [60-BAR CLEAN PRO] SYNCED\n\n"
                         f"Asset: #{tv_name} ({sym_cfg['exchange'].upper()})\n"
                         f"Price: ${curr_close:.2f}\n"
                         f"Active TV Position: {state_str}\n"
                         f"Last Signal Price: {sig_p_str}\n"
-                        f"Params: 20, 50, 200, 14, 2.4, 10, 0.55, 12"
+                        f"Params: 12, 5, 60, 12, 1.25, 0.50"
                     )
                     if not (buy_triggered_last or sell_triggered_last):
                         continue
 
+                # --------------------------------------------------------------
+                # C) NEW CONFIRMED SIGNAL ALERTS (EXACT TRADINGVIEW ARROWS)
+                # --------------------------------------------------------------
                 if buy_triggered_last:
                     prev_entry = trade["entry_price"] if trade["side"] == "SELL" and trade["entry_price"] > 0 else prev_sig_price
                     if not np.isnan(prev_entry) and prev_entry > 0:
@@ -361,17 +425,26 @@ def run_strategy():
                             f"Result: {badge} ({pnl_pts:+.2f} USDT / {pnl_pct:+.2f}%)"
                         )
 
-                    sl_level = lows[-1] - (atrs[-1] * 0.5)
-                    trade["side"] = "BUY"
-                    trade["entry_price"] = curr_close
-                    trade["sl_level"] = sl_level
+                    mid_pullback = (highs[-1] + lows[-1]) * 0.5
+                    entry_rec    = mid_pullback if is_giant else curr_close
+                    sl_level     = entry_rec * (1 - MAX_SL_PCT)
+                    tp_level     = entry_rec * (1 + TRAIL_START_PCT)
 
+                    trade["side"]         = "BUY"
+                    trade["entry_price"]  = entry_rec
+                    trade["peak_price"]   = curr_close
+                    trade["sl_level"]     = sl_level
+                    trade["be_alerted"]   = False
+                    trade["trail_active"] = False
+
+                    entry_mode = f"BUY (50% PULLBACK LIMIT @ ${mid_pullback:.2f})" if is_giant else f"BUY (MARKET @ ${curr_close:.2f})"
                     send_telegram(
-                        f"🟢 SMC SNIPER BUY ALERT\n\n"
+                        f"🟢 INSTITUTIONAL SMC BUY ALERT\n\n"
                         f"Asset: #{tv_name}\n"
-                        f"Entry Price: ${curr_close:.2f}\n"
-                        f"Suggested SL: ${sl_level:.2f}\n"
-                        f"Target (1:2): ${curr_close + (curr_close - sl_level) * 2:.2f}"
+                        f"Action: {entry_mode}\n"
+                        f"Max SL (1.2%): ${sl_level:.2f}\n"
+                        f"Breakeven Shift (+1.2%): ${entry_rec * (1 + BREAKEVEN_TRIG):.2f}\n"
+                        f"Trail Lock Start (+2.2%): ${tp_level:.2f}"
                     )
 
                 elif sell_triggered_last:
@@ -387,17 +460,26 @@ def run_strategy():
                             f"Result: {badge} ({pnl_pts:+.2f} USDT / {pnl_pct:+.2f}%)"
                         )
 
-                    sl_level = highs[-1] + (atrs[-1] * 0.5)
-                    trade["side"] = "SELL"
-                    trade["entry_price"] = curr_close
-                    trade["sl_level"] = sl_level
+                    mid_pullback = (highs[-1] + lows[-1]) * 0.5
+                    entry_rec    = mid_pullback if is_giant else curr_close
+                    sl_level     = entry_rec * (1 + MAX_SL_PCT)
+                    tp_level     = entry_rec * (1 - TRAIL_START_PCT)
 
+                    trade["side"]         = "SELL"
+                    trade["entry_price"]  = entry_rec
+                    trade["peak_price"]   = curr_close
+                    trade["sl_level"]     = sl_level
+                    trade["be_alerted"]   = False
+                    trade["trail_active"] = False
+
+                    entry_mode = f"SELL (50% PULLBACK LIMIT @ ${mid_pullback:.2f})" if is_giant else f"SELL (MARKET @ ${curr_close:.2f})"
                     send_telegram(
-                        f"🔴 SMC SNIPER SELL ALERT\n\n"
+                        f"🔴 INSTITUTIONAL SMC SELL ALERT\n\n"
                         f"Asset: #{tv_name}\n"
-                        f"Entry Price: ${curr_close:.2f}\n"
-                        f"Suggested SL: ${sl_level:.2f}\n"
-                        f"Target (1:2): ${curr_close - (sl_level - curr_close) * 2:.2f}"
+                        f"Action: {entry_mode}\n"
+                        f"Max SL (1.2%): ${sl_level:.2f}\n"
+                        f"Breakeven Shift (+1.2%): ${entry_rec * (1 - BREAKEVEN_TRIG):.2f}\n"
+                        f"Trail Lock Start (+2.2%): ${tp_level:.2f}"
                     )
 
                 last_processed_candle_time[tv_name] = closed_time
